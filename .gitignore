@@ -1,0 +1,70 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environment
+venv/
+.env/
+.venv/
+
+# Environment variables
+*.env
+*.env.*
+!.env.example
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyd
+*.pyo
+
+# Caches
+.cache/
+pytest_cache/
+pip-cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pyre/
+
+# VSCode
+.vscode/
+.code-workspace
+
+# Pycharm
+.idea/
+
+# Logs
+*.log
+logs/
+
+# Local SQLite databases
+*.db
+*.sqlite3
+
+# Build and distribution folders
+build/
+dist/
+*.egg-info/
+*.egg
+
+# __pycache__ (again for nested)
+**/__pycache__/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+.cache/
+
+# Static / media (if generated)
+staticfiles/
+media/
+
+# Uvicorn PID files
+uvicorn.pid
+
+# Docker
+docker-data/

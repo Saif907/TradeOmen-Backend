@@ -1,0 +1,17 @@
+# Web Framework (FastAPI)
+fastapi
+uvicorn[standard]
+pydantic
+pydantic-settings      # Modern, secure environment variable management
+
+# Database (Supabase / Postgres Integration)
+supabase           # To securely interface with Supabase Auth/Postgrest REST API
+httpx                  # Used by supabase for making asynchronous requests
+
+# Security & Authentication
+passlib[bcrypt]        # For secure password hashing (industry standard: bcrypt)
+python-jose[cryptography] # For generating and validating JWTs
+cryptography           # For AES-256 data encryption/decryption of sensitive journal notes
+
+# Database Migrations (Optional, but highly recommended for production)
+alembic
