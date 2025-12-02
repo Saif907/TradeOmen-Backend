@@ -56,7 +56,7 @@ def _decrypt_trade_response(trade_data: dict) -> TradeOut:
 async def create_strategy(
     strategy: StrategyCreate,
     user: AuthenticatedUser,
-    db: Client = Depends(DBClient),
+    db: DBClient, # FIX: Used DBClient type alias directly
     _ = Depends(requires_plan("STRATEGY_CREATE")) 
 ):
     """
@@ -82,7 +82,7 @@ async def create_strategy(
 @router.get("/strategies", response_model=List[StrategyOut], summary="List all user strategies")
 async def list_strategies(
     user: AuthenticatedUser,
-    db: Client = Depends(DBClient)
+    db: DBClient # FIX: Used DBClient type alias directly
 ):
     """
     Retrieves all strategies belonging to the authenticated user.
@@ -109,7 +109,7 @@ async def list_strategies(
 async def create_trade(
     trade_data: TradeCreate,
     user: AuthenticatedUser,
-    db: Client = Depends(DBClient),
+    db: DBClient, # FIX: Used DBClient type alias directly
     _ = Depends(requires_plan("CREATE_TRADE_MANUAL")) 
 ):
     """
@@ -155,7 +155,7 @@ async def create_trade(
 @router.get("/trades", response_model=List[TradeOut], summary="Retrieve a list of all user trades")
 async def list_trades(
     user: AuthenticatedUser,
-    db: Client = Depends(DBClient)
+    db: DBClient # FIX: Used DBClient type alias directly
 ):
     """
     Retrieves a paginated list of all trades for the user.

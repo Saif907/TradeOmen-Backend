@@ -5,10 +5,11 @@ from loguru import logger
 from supabase import Client
 from typing import List
 from uuid import UUID
+from anyio import to_thread # FIX: Added missing import
 
 from app.auth.dependency import (
     AuthenticatedUser, 
-    DBClient, 
+    DBClient, # The Annotated type alias
     requires_plan
 )
 from app.libs.data_models import ImportJobStart, ImportJobOut, ImportJobType
@@ -45,7 +46,7 @@ def _upload_file_to_storage(user_id: UUID, file: UploadFile, db: Client) -> str:
 async def start_bulk_import(
     job_start: ImportJobStart,
     user: AuthenticatedUser,
-    db: Client = Depends(DBClient),
+    db: DBClient,
     # Freemium Gate: Bulk import is a paid feature (Acceptable Use Policy)
     _ = Depends(requires_plan("BULK_IMPORT"))
 ):
@@ -97,9 +98,9 @@ async def start_bulk_import(
              summary="Directly uploads a CSV file for import processing")
 async def upload_csv_for_import(
     user: AuthenticatedUser,
+    db: DBClient, # FIX: Moved DBClient (required parameter) before default parameters
     csv_file: UploadFile = File(...),
     job_type: ImportJobType = Form(ImportJobType.CSV_IMPORT),
-    db: Client = Depends(DBClient),
     _ = Depends(requires_plan("BULK_IMPORT"))
 ):
     """
@@ -131,7 +132,7 @@ async def upload_csv_for_import(
 @router.get("/import/jobs", response_model=List[ImportJobOut], summary="List all active/past import jobs")
 async def list_import_jobs(
     user: AuthenticatedUser,
-    db: Client = Depends(DBClient),
+    db: DBClient,
     _ = Depends(requires_plan("BULK_IMPORT"))
 ):
     """

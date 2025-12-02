@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
+from enum import Enum # <-- FIX: Import Enum
 
 from pydantic import BaseModel, Field, condecimal, constr
 
@@ -10,8 +11,20 @@ from pydantic import BaseModel, Field, condecimal, constr
 
 TradeDirection = constr(pattern=r"^(LONG|SHORT|OTHER)$")
 TradeStatus = constr(pattern=r"^(OPEN|CLOSED|CANCELED)$")
-ImportStatus = constr(pattern=r"^(PENDING|PROCESSING|FAILED|COMPLETED|CANCELLED)$")
-ImportJobType = constr(pattern=r"^(CSV_IMPORT|BROKER_SYNC)$")
+
+# FIX: Converted to Enum for proper usage as defaults and better type hint clarity
+class ImportStatus(str, Enum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    FAILED = "FAILED"
+    COMPLETED = "COMPLETED"
+    CANCELLED = "CANCELLED"
+
+# FIX: Converted to Enum for proper usage as defaults and better type hint clarity
+class ImportJobType(str, Enum):
+    CSV_IMPORT = "CSV_IMPORT"
+    BROKER_SYNC = "BROKER_SYNC"
+
 RegionCode = constr(pattern=r"^(IN|US|EU|OTHER)$")
 
 # --- CORE USER MODELS ---

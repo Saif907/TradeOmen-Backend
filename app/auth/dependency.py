@@ -94,7 +94,7 @@ def requires_plan(feature_key: str):
     """
     (Freemium Gate) Factory function for plan-based access control.
     """
-    def check_plan_access(profile: UserProfile = Depends(get_user_profile)):
+    def check_plan_access(profile: UserProfile): # FIX: Removed = Depends(get_user_profile)
         user_plan = profile.get("active_plan_id", "FREE").upper()
         required_plans = [p.upper() for p in settings.REQUIRED_PLANS.get(feature_key, [])]
         
@@ -118,7 +118,7 @@ def check_ai_quota(quota_limit: int):
     """
     (Fair Use Gate) Factory function to check AI usage quota.
     """
-    def check_quota_limit(profile: UserProfile = Depends(get_user_profile)):
+    def check_quota_limit(profile: UserProfile): # FIX: Removed = Depends(get_user_profile)
         user_plan = profile.get("active_plan_id", "FREE").upper()
         quota_used = profile.get("ai_chat_quota_used", 0)
         
@@ -141,7 +141,7 @@ def check_ai_consent(feature_key: str):
     """
     (Legal/Consent Gate) Factory function to enforce explicit consent for data use.
     """
-    def check_consent_status(profile: UserProfile = Depends(get_user_profile)):
+    def check_consent_status(profile: UserProfile): # FIX: Removed = Depends(get_user_profile)
         consent_given = profile.get("consent_ai_training", False)
         user_plan = profile.get("active_plan_id").upper()
         
