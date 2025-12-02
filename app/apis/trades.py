@@ -1,227 +1,177 @@
+# backend/app/apis/trades.py
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from loguru import logger
+from supabase import Client
 from typing import List
-from postgrest.base_request_builder import SingleAPIResponse
+from uuid import UUID
 
-from ..libs import schemas
-from ..libs.config import settings
-from ..libs.security import encrypt_data, decrypt_data
-from ..libs.supabase_client import get_supabase_client, Client
-from ..auth.dependencies import get_current_user, check_plan_access, get_user_supabase_client
+from app.auth.dependency import (
+    AuthenticatedUser, 
+    DBClient, 
+    requires_plan, 
+    check_ai_consent
+)
+from app.libs.data_models import (
+    TradeCreate, 
+    TradeOut, 
+    StrategyCreate, 
+    StrategyOut
+)
+from app.libs.crypto_utils import encrypt_data, decrypt_data
+from app.libs.task_queue import enqueue_task, _invalidate_edge_cache
 
-# Initialize the router
 router = APIRouter()
 
-# Dependency for authentication
-AuthUser = Depends(get_current_user)
+# --- HELPER FUNCTIONS ---
 
-# Dependency for Supabase Client
-SupabaseClient = Depends(get_user_supabase_client)
-
-# --- CRUD Endpoints ---
-
-@router.post(
-    "/",
-    response_model=schemas.TradeResponse,
-    status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(check_plan_access(schemas.PlanFeature.MAX_TRADES_MONTH))]
-)
-async def create_trade(
-    trade_data: schemas.TradeCreate,
-    current_user: schemas.UserInDB = AuthUser,
-    supabase_client: Client = SupabaseClient,
-):
-    """
-    Creates a new trade entry, encrypts notes (Base64 string), and logs to Supabase.
-    """
-    # 1. Prepare Data Structure: mode='json' serializes datetimes to ISO strings
-    trade_in = trade_data.model_dump(mode='json') 
-    trade_in['user_id'] = current_user.user_id
+def _encrypt_trade_notes(trade_data: TradeCreate):
+    """Encrypts the raw_notes field before saving to the database."""
+    if trade_data.raw_notes:
+        try:
+            encrypted = encrypt_data(trade_data.raw_notes)
+            # Create a dictionary suitable for insertion
+            data_to_insert = trade_data.model_dump(exclude={"raw_notes"}, exclude_none=True)
+            data_to_insert['encrypted_notes'] = encrypted
+            return data_to_insert
+        except Exception as e:
+            logger.error(f"ENCRYPTION_FAIL: Could not encrypt trade notes: {e}")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to secure trade notes.")
     
-    # 2. Handle Sensitive Notes and Encryption
-    raw_notes = trade_in.pop('notes', None)
+    # If no notes, just dump the rest of the model
+    return trade_data.model_dump(exclude_none=True)
 
-    if raw_notes:
-        # ENCRYPTION: encrypt_data now returns a Base64 STRING
-        trade_in['notes_encrypted'] = encrypt_data(raw_notes)
-        
-    # 3. Insert trade into Supabase
-    try:
-        response: SingleAPIResponse = supabase_client.table("trades").insert(trade_in).execute()
+def _decrypt_trade_response(trade_data: dict) -> TradeOut:
+    """Decrypts the encrypted_notes field for API output and returns the Pydantic model."""
+    if trade_data.get('encrypted_notes'):
+        # Add the decrypted content to the 'raw_notes' field
+        trade_data['raw_notes'] = decrypt_data(trade_data['encrypted_notes'])
+    
+    return TradeOut.model_validate(trade_data)
 
-        if not response.data:
-             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Database failed to return the created trade.",
-            )
+# --- STRATEGY ENDPOINTS ---
 
-        # 4. Decrypt notes for the final response to the user
-        created_trade_data = response.data[0]
-        # Decrypt expects the Base64 string from the database
-        encrypted_notes_str = created_trade_data.pop('notes_encrypted', None)
-        if encrypted_notes_str:
-            created_trade_data['notes'] = decrypt_data(encrypted_notes_str)
-            
-        return schemas.TradeResponse(**created_trade_data)
-
-    except Exception as e:
-        error_detail = str(e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred while creating the trade: {error_detail}",
-        )
-
-
-@router.get(
-    "/",
-    response_model=List[schemas.TradeResponse],
-)
-async def read_trades(
-    current_user: schemas.UserInDB = AuthUser,
-    supabase_client: Client = SupabaseClient,
+@router.post("/strategies", response_model=StrategyOut, status_code=status.HTTP_201_CREATED, 
+             summary="Create a new trading strategy")
+async def create_strategy(
+    strategy: StrategyCreate,
+    user: AuthenticatedUser,
+    db: Client = Depends(DBClient),
+    _ = Depends(requires_plan("STRATEGY_CREATE")) 
 ):
     """
-    Retrieves all trades belonging to the authenticated user and decrypts notes.
+    Creates a new user-specific trading strategy template (Playbook).
+    (RLS & Modular)
+    """
+    data_to_insert = strategy.model_dump(exclude_none=True)
+    data_to_insert['user_id'] = user.user_id
+
+    try:
+        response = db.table('strategies').insert(data_to_insert).execute()
+        
+        # Invalidate the cache for the user's strategy list (Efficiency)
+        await _invalidate_edge_cache(payload={"cache_path": f"/v1/trades/strategies/list/{user.user_id}"})
+        
+        logger.success(f"STRATEGY_CREATE: User {user.user_id} created new strategy '{strategy.name}'.")
+        return StrategyOut.model_validate(response.data[0])
+    except Exception as e:
+        logger.error(f"DB_ERROR: Failed to create strategy for user {user.user_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to save strategy.")
+
+
+@router.get("/strategies", response_model=List[StrategyOut], summary="List all user strategies")
+async def list_strategies(
+    user: AuthenticatedUser,
+    db: Client = Depends(DBClient)
+):
+    """
+    Retrieves all strategies belonging to the authenticated user.
+    (RLS Enforced, Caching Supported)
     """
     try:
-        response: SingleAPIResponse = supabase_client.table("trades").select("*").order("entry_datetime", desc=True).execute()
+        response = db.table('strategies').select('*').eq('user_id', user.user_id).order('created_at', desc=True).execute()
         
-        trades_list = []
-        for trade_data in response.data:
-            # 2. DECRYPTION: Decrypt notes (Base64 string from DB)
-            encrypted_notes_str = trade_data.pop('notes_encrypted', None)
-            trade_data['notes'] = decrypt_data(encrypted_notes_str) if encrypted_notes_str else None
-            
-            # 3. Validate and add to list
-            trades_list.append(schemas.TradeResponse(**trade_data))
-            
+        # NOTE: Read endpoints should set Cache-Control headers, but we rely on Vercel/Render settings
+        # to apply a max-age cache policy for global speed.
+        
+        return [StrategyOut.model_validate(item) for item in response.data]
+    except Exception as e:
+        logger.error(f"DB_ERROR: Failed to list strategies for user {user.user_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve strategies.")
+
+
+# (TODO: Add GET/{id}, PUT/{id}, DELETE/{id} for strategies)
+
+# --- TRADE ENDPOINTS ---
+
+@router.post("/trades", response_model=TradeOut, status_code=status.HTTP_201_CREATED, 
+             summary="Log a new manual trade entry")
+async def create_trade(
+    trade_data: TradeCreate,
+    user: AuthenticatedUser,
+    db: Client = Depends(DBClient),
+    _ = Depends(requires_plan("CREATE_TRADE_MANUAL")) 
+):
+    """
+    Logs a new trade. Encrypts sensitive notes before saving. Triggers AI analysis asynchronously.
+    (Security, Privacy, Super Fast)
+    """
+    # 1. Encrypt sensitive data (Privacy Policy 1.B)
+    data_to_insert = _encrypt_trade_notes(trade_data)
+    data_to_insert['user_id'] = user.user_id
+
+    try:
+        # 2. Insert trade into the RLS-enforced table
+        response = db.table('trades').insert(data_to_insert).execute()
+        new_trade = response.data[0]
+        
+        # 3. Trigger Asynchronous AI Analysis (Robustness/Efficiency)
+        # This offloads processing, keeping the API fast.
+        await enqueue_task(
+            task_name="trade_analysis", 
+            payload={
+                "trade_id": str(new_trade['id']), 
+                "user_id": str(user.user_id),
+                "encrypted_notes": new_trade.get('encrypted_notes')
+            }
+        )
+        
+        # 4. Invalidate cache for the trades list and dashboard (Edge-First Architecture)
+        await _invalidate_edge_cache(payload={"cache_path": f"/v1/trades/list/{user.user_id}"})
+        await _invalidate_edge_cache(payload={"cache_path": f"/v1/analytics/kpis/{user.user_id}"})
+        
+        logger.success(f"TRADE_CREATE: User {user.user_id} logged trade {new_trade['id']}. AI job queued.")
+        
+        # 5. Return the trade with notes decrypted for immediate frontend display
+        return _decrypt_trade_response(new_trade)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"DB_ERROR: Failed to create trade for user {user.user_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to log trade entry.")
+
+
+@router.get("/trades", response_model=List[TradeOut], summary="Retrieve a list of all user trades")
+async def list_trades(
+    user: AuthenticatedUser,
+    db: Client = Depends(DBClient)
+):
+    """
+    Retrieves a paginated list of all trades for the user.
+    (RLS Enforced, Caching Supported)
+    """
+    try:
+        # Fetch up to 50 trades, RLS ensures we only see our own.
+        response = db.table('trades').select('*').eq('user_id', user.user_id).order('entry_time', desc=True).limit(50).execute()
+        
+        # Decrypt notes before returning to client (Privacy/Security boundary)
+        trades_list = [_decrypt_trade_response(item) for item in response.data]
+        
         return trades_list
 
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred while fetching trades: {e}",
-        )
-        
-@router.get(
-    "/{trade_id}",
-    response_model=schemas.TradeResponse,
-)
-async def read_trade(
-    trade_id: str,
-    current_user: schemas.UserInDB = AuthUser,
-    supabase_client: Client = SupabaseClient,
-):
-    """
-    Retrieves a single trade by ID, decrypts notes, and ensures ownership.
-    """
-    try:
-        response: SingleAPIResponse = (
-            supabase_client.table("trades")
-            .select("*")
-            .eq("id", trade_id)
-            .single()
-            .execute()
-        )
-        
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Trade not found or you do not have permission to access it.",
-            )
-            
-        # 1. DECRYPTION: Decrypt notes (Base64 string from DB)
-        trade_data = response.data
-        encrypted_notes_str = trade_data.pop('notes_encrypted', None)
-        trade_data['notes'] = decrypt_data(encrypted_notes_str) if encrypted_notes_str else None
-            
-        return schemas.TradeResponse(**trade_data)
+        logger.error(f"DB_ERROR: Failed to list trades for user {user.user_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve trade list.")
 
-    except Exception as e:
-        if hasattr(e, 'message') and ('not found' in e.message or 'None is not subscriptable' in e.message):
-             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Trade not found or you do not have permission to access it.",
-            )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred while fetching the trade: {e}",
-        )
-
-
-@router.put(
-    "/{trade_id}",
-    response_model=schemas.TradeResponse,
-)
-async def update_trade(
-    trade_id: str,
-    trade_data: schemas.TradeCreate,
-    current_user: schemas.UserInDB = AuthUser,
-    supabase_client: Client = SupabaseClient,
-):
-    """
-    Updates an existing trade, re-encrypting notes if they are present.
-    """
-    # 1. Prepare Data Structure: mode='json' serializes datetimes to ISO strings
-    update_data = trade_data.model_dump(exclude_unset=True, mode='json')
-    
-    # 2. Handle notes update with re-encryption
-    if 'notes' in update_data:
-        raw_notes = update_data.pop('notes')
-        if raw_notes:
-            # Re-encryption to Base64 string
-            update_data['notes_encrypted'] = encrypt_data(raw_notes)
-        else:
-            # Handle clearing notes
-            update_data['notes_encrypted'] = None
-    
-    try:
-        response: SingleAPIResponse = (
-            supabase_client.table("trades")
-            .update(update_data)
-            .eq("id", trade_id)
-            .execute()
-        )
-
-        if not response.data:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Trade not found or you do not have permission to update it.",
-            )
-            
-        # Decrypt notes for response
-        updated_trade_data = response.data[0]
-        encrypted_notes_str = updated_trade_data.pop('notes_encrypted', None)
-        updated_trade_data['notes'] = decrypt_data(encrypted_notes_str) if encrypted_notes_str else None
-            
-        return schemas.TradeResponse(**updated_trade_data)
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred while updating the trade: {e}",
-        )
-
-
-@router.delete(
-    "/{trade_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def delete_trade(
-    trade_id: str,
-    current_user: schemas.UserInDB = AuthUser,
-    supabase_client: Client = SupabaseClient,
-):
-    """
-    Deletes a trade, enforcing ownership and RLS.
-    """
-    try:
-        # Delete the record where ID matches (RLS ensures ownership)
-        supabase_client.table("trades").delete().eq("id", trade_id).execute()
-        
-        return 
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred while deleting the trade: {e}",
-        )
+# (TODO: Add GET/{id}, PUT/{id}, DELETE/{id} for trades)

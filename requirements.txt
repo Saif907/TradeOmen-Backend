@@ -15,3 +15,4 @@ cryptography           # For AES-256 data encryption/decryption of sensitive jou
 
 # Database Migrations (Optional, but highly recommended for production)
 alembic
+loguru                # For enhanced logging during migrations

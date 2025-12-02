@@ -1,67 +1,114 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Body
-from typing import Dict, Any
+# backend/app/apis/auth.py
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from loguru import logger
 from supabase import Client
-from postgrest.base_request_builder import SingleAPIResponse
+from typing import Dict, Any
 
-from ..libs import schemas
-from ..auth.dependencies import AuthUser, ServiceSupabaseClient # <-- Import Service Client
+from app.auth.dependency import (
+    AuthenticatedUser, 
+    UserProfile, 
+    DBClient, 
+    FounderDBAccess
+)
+from app.libs.data_models import UserProfileUpdate
+from app.libs.supabase_client import get_supabase_client # Needed for direct Depends if not using Annotated
 
-# Initialize the router
 router = APIRouter()
 
-class SupabaseLoginPayload(schemas.BaseModel):
-    pass
+# --- Public Endpoint: Founder/Dev Access ---
 
-@router.post(
-    "/login",
-    response_model=schemas.UserInDB,
-)
-async def login_and_verify_session(
-    current_user: schemas.UserInDB = AuthUser,
-    # Use the SERVICE ROLE client, which can bypass RLS to force profile creation
-    supabase_service_client: Client = ServiceSupabaseClient,
-    payload: SupabaseLoginPayload = Body(None) 
+@router.get("/admin/profile/{user_id}", response_model=Dict[str, Any], tags=["Founder Tools"])
+async def get_any_user_profile_admin(
+    user_id: str,
+    db: FounderDBAccess # Corrected: Use Annotated type directly
 ):
     """
-    Verifies JWT and creates the public.user_profiles row if it doesn't exist.
-    This function is IDEMPOTENT (safe to call repeatedly) and guarantees 
-    the Foreign Key dependency is met.
+    [ADMIN ONLY] Retrieves any user profile using the Service Role Key.
     """
-    user_id = current_user.user_id
-    
-    # 1. Prepare data for insertion/upsert
-    profile_data = {
-        'user_id': user_id,
-        # 'plan': current_user.plan.value # Optional: set initial plan here
-    }
-    
+    logger.warning(f"ADMIN_ACCESS: Retrieving profile for user {user_id} via Service Key.")
     try:
-        # 2. Perform UPSERT: Insert OR Update on Conflict (user_id)
-        # This guarantees the row exists after the call and will not throw an error
-        # if the row already exists (solving the race condition).
-        response: SingleAPIResponse = (
-            supabase_service_client.table("user_profiles")
-            .upsert(profile_data, on_conflict="user_id") 
-            .execute()
-        )
+        response = db.table('user_profiles').select('*').eq('id', user_id).single().execute()
         
-        # 3. Return the authenticated user object, confirming the profile exists.
-        return current_user
+        if not response.data:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"User profile {user_id} not found.")
+
+        return response.data
+    except Exception as e:
+        logger.error(f"DB_ERROR: Admin retrieval failed for user {user_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve profile.")
+
+
+# --- Authenticated Endpoints: User CRUD ---
+
+@router.get("/users/me", response_model=Dict[str, Any], summary="Get my profile and plan status")
+async def get_my_profile(
+    profile: UserProfile # Corrected: Use Annotated type directly
+):
+    """
+    Retrieves the currently authenticated user's profile.
+    """
+    logger.info(f"PROFILE_RETRIEVE: User {profile['id']} fetched profile.")
+    return profile
+
+@router.post("/users/initialize", status_code=status.HTTP_201_CREATED, summary="Initialize profile after Supabase signup")
+async def initialize_user_profile(
+    user: AuthenticatedUser, # Corrected
+    db: DBClient             # Corrected: Use Annotated type directly
+):
+    """
+    Creates the initial user_profiles entry.
+    """
+    try:
+        existing = db.table('user_profiles').select('id').eq('id', str(user.user_id)).maybe_single().execute()
+        if existing.data:
+            logger.warning(f"PROFILE_EXISTS: Attempted initialization for existing user {user.user_id}.")
+            return {"detail": "Profile already exists."}
+
+        data_to_insert = {
+            'id': str(user.user_id),
+            'active_plan_id': 'FREE',
+            'region_code': 'US', 
+            'default_currency': 'USD',
+            'ai_chat_quota_used': 0,
+            'consent_ai_training': False,
+        }
+        
+        db.table('user_profiles').insert(data_to_insert).execute()
+        logger.success(f"PROFILE_CREATE: Successfully initialized profile for new user {user.user_id}.")
+        
+        return {"detail": "Profile initialized successfully."}
 
     except Exception as e:
-        # If the upsert fails for reasons other than expected conflict
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Fatal error during profile creation/sync: {e}",
-        )
+        logger.error(f"DB_ERROR: Profile initialization failed for user {user.user_id}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to initialize user profile.")
 
 
-@router.get(
-    "/user",
-    response_model=schemas.UserInDB,
-)
-def get_user_profile(
-    current_user: schemas.UserInDB = AuthUser
+@router.put("/users/me", response_model=Dict[str, Any], summary="Update my profile settings and consent")
+async def update_my_profile(
+    update_data: UserProfileUpdate,
+    profile: UserProfile, # Corrected
+    db: DBClient          # Corrected
 ):
-    """Returns the currently authenticated user's profile and plan details."""
-    return current_user
+    """
+    Allows user to update settings.
+    """
+    data = update_data.model_dump(exclude_unset=True, exclude_none=True)
+    
+    if not data:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No valid fields provided for update.")
+
+    try:
+        response = db.table('user_profiles').update(data).eq('id', profile['id']).execute()
+        
+        if not response.data:
+            logger.warning(f"PROFILE_UPDATE_FAIL: No rows updated for user {profile['id']}.")
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Profile update failed or profile not found.")
+            
+        logger.success(f"PROFILE_UPDATE: User {profile['id']} updated fields: {', '.join(data.keys())}.")
+        
+        return response.data[0] 
+
+    except Exception as e:
+        logger.error(f"DB_ERROR: Profile update failed for user {profile['id']}: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Database error during profile update.")

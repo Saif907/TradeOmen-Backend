@@ -1,39 +1,63 @@
-import httpx
+# backend/app/libs/supabase_client.py
+
+import os
 from supabase import create_client, Client
-from ..libs.config import settings
+from typing import Optional
+from loguru import logger
+from dotenv import load_dotenv
 
-# Initialize the Supabase Client
-# We use the Service Key for internal server-side operations where RLS might need to be bypassed 
-# (e.g., when the AI microservice requests anonymized data, or for administrative tasks).
-# For user-facing requests, we primarily rely on the user's JWT and RLS in the dependency layer.
+load_dotenv()
 
-try:
-    # Initialize the global Supabase client instance
-    # Note: supabase-py uses httpx internally, which is now isolated from the LLM service.
-    supabase: Client = create_client(
-        supabase_url=settings.SUPABASE_URL,
-        supabase_key=settings.SUPABASE_KEY  # Using the public key for client initialization
-    )
-    
-    # Initialize a client that uses the highly privileged Service Role Key 
-    # to perform server-side operations (like inserting a user's initial plan)
-    # or querying the database without RLS restrictions (ONLY used internally and securely).
-    supabase_service_role: Client = create_client(
-        supabase_url=settings.SUPABASE_URL,
-        supabase_key=settings.SUPABASE_SERVICE_KEY
-    )
-    
-except httpx.InvalidURL:
-    # Handle case where SUPABASE_URL is malformed in .env
-    print("FATAL ERROR: Invalid Supabase URL. Check backend/.env")
-    exit(1)
+# --- Configuration ---
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
-
-# Dependency to be used in FastAPI endpoints for accessing the Supabase client
-def get_supabase_client() -> Client:
-    """Returns the main public Supabase client instance."""
-    return supabase
+# --- Global Client Instances ---
+_service_client: Optional[Client] = None
 
 def get_supabase_service_client() -> Client:
-    """Returns the privileged Supabase Service Role client instance."""
-    return supabase_service_role
+    """
+    (Security/Founder Access) Initializes and returns the Supabase client using the Service Role Key.
+    
+    CRITICAL: This client bypasses ALL RLS and should ONLY be used for founder tools
+    and administrative/system tasks (e.g., initial profile creation).
+    """
+    global _service_client
+    
+    if _service_client is None:
+        if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+            logger.error("FATAL: Supabase URL or SERVICE_KEY missing.")
+            raise ValueError("Supabase configuration missing.")
+        
+        try:
+            # We use the Service Key as the token for service-level access
+            _service_client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+            logger.info("Supabase Service Client initialized.")
+        except Exception as e:
+            logger.error(f"Error initializing Supabase Service Client: {e}")
+            raise RuntimeError("Could not initialize Supabase client.") from e
+            
+    return _service_client
+
+def get_supabase_client(jwt_token: str = None) -> Client:
+    """
+    (RLS Enforced) Returns a standard Supabase client instance.
+    
+    When a JWT is provided (via FastAPI dependency), RLS is automatically enforced.
+    This ensures multi-tenant security for every standard user request.
+    """
+    # For authenticated requests, the JWT is the key to RLS enforcement.
+    if jwt_token:
+        # Create a new client bound to the request's JWT for thread safety and RLS
+        return create_client(SUPABASE_URL, jwt_token)
+    
+    # Fallback/Default Client (Should rarely be used for transactional data)
+    return get_supabase_service_client()
+
+
+def get_founder_db_access() -> Client:
+    """
+    FastAPI dependency that provides unrestricted access for founder tools.
+    """
+    # Simply delegates to the Service Client
+    return get_supabase_service_client()
