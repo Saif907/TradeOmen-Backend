@@ -1,45 +1,36 @@
+# backend/run.sh
 #!/bin/bash
-# run.sh
-# Executes the FastAPI application using Uvicorn with performance settings.
 
-# --- 1. Environment and Performance Configuration ---
+# Exit immediately if a command exits with a non-zero status (robustness)
+set -e
 
-# Ensure the virtual environment is sourced
-if [ -z "$VIRTUAL_ENV" ]; then
-    echo "Activating virtual environment..."
-    source .venv/bin/activate
-fi
-
-# Determine the number of CPU cores for Uvicorn workers
-# Using a common heuristic: (2 * number of cores) + 1, or just 4-8 workers for cloud deployments
-WORKERS=$(nproc --all)
-if [ "$WORKERS" -gt 8 ]; then
-    WORKERS=8 # Cap the number of workers to prevent memory exhaustion on typical cloud instances
-fi
-
-# Set host and port based on standard configuration
-HOST="0.0.0.0"
-PORT=8000
-
-# --- 2. Execution ---
-echo "--- Starting TradeLM Backend Server ---"
-echo "Host: $HOST:$PORT | Workers: $WORKERS | Environment: $(cat .env | grep ENVIRONMENT | cut -d '=' -f2)"
-echo "Using high-performance Uvicorn configuration (uvloop/httptools)."
-
-# Execute Uvicorn in production mode (or standard mode if not found)
-# --log-level info: Standard logging level for production
-# --factory: Tells uvicorn to look for a creatable app instance (if needed in future refactoring)
-# --workers: Enables process parallelism for multi-core performance
-exec uvicorn main:app \
-    --host $HOST \
-    --port $PORT \
-    --log-level info \
-    --workers $WORKERS \
-    --factory 
-
-# --- 3. Error Handling ---
-# If the exec command fails (e.g., Uvicorn not installed or fatal import error)
-if [ $? -ne 0 ]; then
-    echo "Error: Uvicorn server failed to start. Check dependencies and logs."
+# --- Configuration Loading and Check ---
+# Source the .env file to load environment variables for Uvicorn
+if [ -f ".env" ]; then
+    export $(grep -v '^#' .env | xargs)
+else
+    echo "Error: .env file not found. Please create it or run ./install.sh"
     exit 1
+fi
+
+# 1. Activate the virtual environment
+if [ -d "venv" ]; then
+    source venv/bin/activate
+else
+    echo "Error: Virtual environment 'venv' not found. Please run ./install.sh first."
+    exit 1
+fi
+
+echo "--- Starting TradeLM AI Backend (v${APP_VERSION:-1.0.0}) ---"
+echo "Environment: ${ENVIRONMENT:-development}"
+echo "Listening on http://${SERVER_HOST:-0.0.0.0}:${SERVER_PORT:-8080}"
+
+# 2. Start Uvicorn server based on the environment (Efficiency & Standards)
+if [ "$ENVIRONMENT" = "production" ]; then
+    # Use --workers > 1 for multi-core performance in production
+    # --factory is used to ensure clean app instantiation/shutdown across workers
+    uvicorn main:app --factory --host 0.0.0.0 --port ${SERVER_PORT:-8080} --workers ${MAX_WORKER_THREADS:-4}
+else
+    # Use --reload for development for convenience
+    uvicorn main:app --factory --reload --host ${SERVER_HOST:-0.0.0.0} --port ${SERVER_PORT:-8080}
 fi

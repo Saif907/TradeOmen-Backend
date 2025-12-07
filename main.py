@@ -1,139 +1,112 @@
 # backend/main.py
-
-import os
-import time
-import httpx # Import httpx for client management
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse
-from loguru import logger
-from dotenv import load_dotenv
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+import time
+import logging
 
-# --- 1. Configuration and Initialization ---
+from app.core.config import settings
+from app.core.database import db  # ✅ Imported
+from app.apis.v1 import api_router # ✅ Imported
+from app.core.exception import (
+    global_exception_handler, 
+    http_exception_handler, 
+    validation_exception_handler
+)
 
-load_dotenv()
-ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-
-logger.add("app.log", rotation="10 MB", retention="10 days", level="INFO")
-logger.info(f"Starting TradeLM API in {ENVIRONMENT} environment.")
-
-# Import modular components
-from app.auth.jwt_handler import JWTAuthError, set_async_client # Import setter
-from app.libs.supabase_client import get_supabase_service_client
-from app.apis import auth, trades, data_import, ai_chat, billing
-
-# --- 2. Application Lifespan (Robustness) ---
+# Setup Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Handles critical startup and shutdown procedures.
-    Initializes the shared ASYNC HTTP client for efficient I/O.
+    Lifespan context manager for FastAPI.
+    Handles startup and shutdown events efficiently.
     """
-    logger.info("Application startup: Initializing services...")
+    # --- Startup ---
+    logger.info(f"🚀 Starting {settings.APP_NAME} in {settings.ENVIRONMENT} mode...")
     
-    # Initialize ASYNC HTTP Client (CRITICAL for non-blocking I/O)
-    try:
-        async_client = httpx.AsyncClient()
-        set_async_client(async_client) # Set client for JWT handler
-        logger.success("Async HTTP Client initialized.")
-    except Exception as e:
-        logger.error(f"FATAL: Async HTTP Client failed to initialize: {e}")
-
-    try:
-        get_supabase_service_client()
-        logger.success("Supabase service client initialized and connected successfully.")
-    except Exception as e:
-        logger.error(f"FATAL: Database connectivity failed during startup: {e}")
-
-    logger.info("Application startup complete. Ready to serve requests.")
+    # ✅ Initialize Database Connection
+    if settings.DATABASE_DSN:
+        await db.connect()
+    
+    # ✅ Print Routes for Debugging
+    logger.info("🗺️  AVAILABLE ROUTES:")
+    for route in app.routes:
+        if hasattr(route, "methods"):
+            logger.info(f"   {route.methods} {route.path}")
+        else:
+            logger.info(f"   {route.path}")
+    
     yield
     
     # --- Shutdown ---
-    logger.info("Application shutdown: Cleaning up resources...")
-    # Close the ASYNC HTTP Client gracefully
+    logger.info("🛑 Shutting down application...")
+    if settings.DATABASE_DSN:
+        await db.disconnect()
+    
+    # Close LLM client if it exists
     try:
-        await async_client.aclose()
-        logger.success("Async HTTP Client closed gracefully.")
-    except Exception as e:
-        logger.error(f"ERROR: Failed to close Async HTTP Client: {e}")
-        
-    logger.info("Application shutdown complete.")
-
-
-# --- 3. FastAPI Initialization ---
+        from app.lib.llm_client import llm_client
+        await llm_client.close()
+    except ImportError:
+        pass
 
 app = FastAPI(
-    title="TradeLM AI Journal API",
-    description="High-performance, privacy-first backend for trading journal analytics and AI coaching.",
-    version="1.0.0",
-    lifespan=lifespan
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    lifespan=lifespan,
+    docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
+    redoc_url=None
 )
 
-# --- 4. Global Exception Handling (Non-Breakable) ---
+# --- Exception Handlers ---
+app.add_exception_handler(Exception, global_exception_handler)
+app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
 
-@app.exception_handler(JWTAuthError)
-async def jwt_auth_exception_handler(request: Request, exc: JWTAuthError):
-    """Handles custom JWT authentication failures cleanly (401)."""
-    logger.warning(f"AUTH_FAIL: {exc.detail} for path: {request.url.path}")
-    return JSONResponse(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        content={"detail": "Invalid authentication credentials or session expired. Please log in again."},
-    )
-
-@app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    """Handles all unexpected internal errors, ensuring a 500 response (Robustness)."""
-    logger.exception(f"CRITICAL_ERROR: Unhandled Internal Server Error on path: {request.url.path}")
-    return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "An unexpected server error occurred. We are investigating the issue."},
-    )
-
-
-# --- 5. Middleware (Super Fast, Secure, and Efficient) ---
-
+# --- Middleware ---
 @app.middleware("http")
-async def process_request_middleware(request: Request, call_next):
-    """Middleware for request logging, timing (efficiency), and security headers."""
-    
+async def add_process_time_header(request: Request, call_next):
     start_time = time.time()
-    
-    logger.info(f"--> Incoming Request: {request.method} {request.url.path}")
-    
     response = await call_next(request)
-    
     process_time = time.time() - start_time
-    logger.info(f"<-- Outgoing Response: {response.status_code} in {process_time:.4f}s")
-
-    # Add security headers (Professional Standard / Security)
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    
-    # CRITICAL for Edge-First Caching Architecture: Enforce No-Cache on writes
-    if request.method in ["POST", "PUT", "DELETE", "PATCH"]:
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-
+    response.headers["X-Process-Time"] = str(process_time)
     return response
 
-# --- 6. Core API Health Check (/health) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-@app.get("/health", summary="Basic health check for load balancer and monitoring")
+# --- Router Registration ---
+# ✅ THIS IS THE FIX: Include the API router
+app.include_router(api_router, prefix="/api/v1")
+
+# --- Core Endpoints ---
+@app.get("/health", tags=["System"])
 async def health_check():
-    """Returns application status and checks key dependencies."""
     return {
-        "status": "UP",
-        "database": "CLIENT_INITIALIZED", 
-        "environment": ENVIRONMENT,
-        "version": app.version
+        "status": "healthy",
+        "app": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "environment": settings.ENVIRONMENT,
+        "database_pool": "connected" if db.is_connected else "disconnected"
     }
 
+@app.get("/", tags=["System"])
+async def root():
+    return {
+        "message": "Welcome to TradeLM AI API", 
+        "docs": "/docs" if settings.ENVIRONMENT != "production" else "Hidden"
+    }
 
-# --- 7. Route Inclusion (Modular Design) ---
-
-app.include_router(auth.router, prefix="/v1/auth", tags=["Auth & Profiles"])
-app.include_router(trades.router, prefix="/v1/trades", tags=["Trades & Strategies"])
-app.include_router(data_import.router, prefix="/v1/data", tags=["Data Import & Brokers"])
-app.include_router(ai_chat.router, prefix="/v1/ai", tags=["AI Chat & Coaching"])
-app.include_router(billing.router, prefix="/v1/billing", tags=["Subscriptions & Webhooks"])
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host=settings.SERVER_HOST, port=settings.SERVER_PORT, reload=True)

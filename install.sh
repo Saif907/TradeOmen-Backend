@@ -1,65 +1,57 @@
+# backend/install.sh
 #!/bin/bash
-# install.sh
-# Automated setup script for the TradeLM FastAPI backend service.
 
-echo "--- Starting TradeLM Backend Installation ---"
+echo "--- TradeLM AI Backend Setup ---"
 
-# --- 1. Environment Check and Setup ---
-# Check if Python is available
-if ! command -v python3 &> /dev/null
-then
-    echo "Error: Python 3 is not installed. Please install Python 3.8+."
-    exit 1
-fi
-
-# Create a virtual environment if it doesn't exist (industry standard for isolation)
-if [ ! -d ".venv" ]; then
+# 1. Create Python Virtual Environment
+if [ ! -d "venv" ]; then
     echo "Creating virtual environment..."
-    python3 -m venv .venv
+    python3 -m venv venv
+else
+    echo "Virtual environment 'venv' already exists."
 fi
 
-# Activate the virtual environment
-source .venv/bin/activate
-echo "Virtual environment activated."
+# 2. Activate Virtual Environment
+source venv/bin/activate
 
-# --- 2. Install Dependencies ---
-echo "Installing Python dependencies from requirements.txt..."
+# 3. Install Dependencies from requirements.txt
+echo "Installing dependencies..."
 pip install --upgrade pip
 pip install -r requirements.txt
 
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to install Python dependencies. Check requirements.txt."
-    exit 1
+# 4. Check for .env file
+if [ ! -f ".env" ]; then
+    echo "WARNING: .env file not found."
+    echo "Copying .env.example to .env. Please edit .env with your secrets."
+    # Create an example/template .env file content directly here (using content from previous step)
+    cat << EOF > .env.example
+# --- GENERAL APP SETTINGS ---
+APP_NAME="TradeLM AI Backend"
+APP_VERSION="1.0.0"
+ENVIRONMENT="development"
+SERVER_HOST="0.0.0.0"
+SERVER_PORT=8080
+CORS_ALLOWED_ORIGINS="*" 
+
+# --- SUPABASE/DATABASE CONFIGURATION ---
+SUPABASE_URL="https://pppdiotmrmeuzhdcpjzt.supabase.co" 
+SUPABASE_SERVICE_ROLE_KEY="your_supabase_service_role_key_here"
+DATABASE_DSN="your_asyncpg_database_dsn_here" 
+
+# --- SECURITY CONFIGURATION ---
+SECRET_KEY="a_very_long_and_random_secret_key_for_jwt_signing"
+ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+
+# --- LLM API KEYS (MANDATORY) ---
+OPENAI_API_KEY="sk-your-openai-key"
+PERPLEXITY_API_KEY="pplx-your-perplexity-key"
+GEMINI_API_KEY="AIzaSy...your-gemini-key"
+
+# --- WORKER CONFIGURATION ---
+MAX_WORKER_THREADS=8
+EOF
+    cp .env.example .env
 fi
-echo "All dependencies installed successfully."
 
-# --- 3. Configuration Check (CRITICAL FOR SECURITY) ---
-echo "Checking for critical environment variables in .env..."
-
-ENV_FILE=".env"
-if [ ! -f "$ENV_FILE" ]; then
-    echo "Warning: .env file not found. Creating a placeholder."
-    echo "# Please fill in these values before running the service!" > "$ENV_FILE"
-    echo "ENVIRONMENT=development" >> "$ENV_FILE"
-    echo "SUPABASE_URL=http://your-supabase-url" >> "$ENV_FILE"
-    echo "SUPABASE_SERVICE_KEY=your-supabase-service-key" >> "$ENV_FILE"
-    echo "ENCRYPTION_KEY=a-secure-32-byte-base64-key-here" >> "$ENV_FILE"
-    echo "REDIS_BROKER_URL=redis://localhost:6379/0" >> "$ENV_FILE"
-    echo "AI_SERVICE_API_KEY=your-internal-ai-secret" >> "$ENV_FILE"
-fi
-
-# Validate critical secrets (non-breakable check)
-if grep -q "your-supabase-service-key" "$ENV_FILE"; then
-    echo "FATAL WARNING: SUPABASE_SERVICE_KEY placeholder found in .env."
-    echo "The service will run but RLS will be compromised if not updated."
-fi
-
-if grep -q "a-secure-32-byte-base64-key-here" "$ENV_FILE"; then
-    echo "FATAL WARNING: ENCRYPTION_KEY placeholder found in .env."
-    echo "Trade notes and chat data will NOT be encrypted until this is fixed."
-fi
-
-# --- 4. Final Instructions ---
-echo "--- Installation Complete ---"
-echo "To run the server, use: source .venv/bin/activate && ./run.sh"
-echo "Remember to customize your .env file with actual secrets!"
+echo "Setup complete. Run 'source venv/bin/activate' and then './run.sh' to start the server."
