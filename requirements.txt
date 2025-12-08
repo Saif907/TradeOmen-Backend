@@ -11,3 +11,5 @@ passlib[bcrypt]
 cryptography
 httpx
 tenacity
+pandas 
+python-multipart

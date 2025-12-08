@@ -38,9 +38,11 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     # We use the raw asyncpg pool for maximum speed
     try:
         if db.pool:
+            # ✅ FIXED: Changed table to 'public.user_profiles' (was 'public.profiles')
+            # ✅ FIXED: Removed 'full_name' as it's not in your user_profiles schema
             query = """
-                SELECT id, full_name, active_plan_id, ai_chat_quota_used, preferences
-                FROM public.profiles 
+                SELECT id, active_plan_id, ai_chat_quota_used, preferences
+                FROM public.user_profiles 
                 WHERE id = $1
             """
             user_profile = await db.fetch_one(query, user_id)
@@ -49,7 +51,7 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
                 # Merge DB profile data (Plan, Quotas) with Auth token data
                 return {**auth_payload, **dict(user_profile)}
             
-            logger.warning(f"User {user_id} authenticated but has no profile table entry.")
+            logger.warning(f"User {user_id} authenticated but has no user_profiles table entry.")
             
         # Fallback: Return just the auth payload if DB lookup fails or profile missing
         return auth_payload
