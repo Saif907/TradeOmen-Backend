@@ -3,26 +3,19 @@ import httpx
 from typing import List, Dict, Any, Optional
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import logging
-import json
 import time
+import json
 
 from app.core.config import settings
+# ✅ NEW IMPORT: Privacy Sanitizer
+from app.lib.data_sanitizer import sanitizer 
 
 logger = logging.getLogger(__name__)
 
 class LLMClient:
     """
     Async client for orchestrating calls to multiple LLM providers.
-    
-    Supported Providers:
-    1. OpenAI (Reasoning, General)
-    2. Perplexity (Real-time Market Data, News)
-    3. Gemini (High Context Window, Multimodal Fallback)
-    
-    Design:
-    - Uses REST APIs directly (no heavy SDKs).
-    - Unified 'generate_response' interface.
-    - Automatic retries for network stability.
+    Includes automatic PII sanitization (Privacy by Design).
     """
     
     def __init__(self):
@@ -40,8 +33,8 @@ class LLMClient:
     async def generate_response(
         self, 
         messages: List[Dict[str, str]], 
-        model: str = "gpt-4-turbo", 
-        provider: str = "openai",
+        model: str = "gemini-2.5-flash", 
+        provider: str = "gemini",
         temperature: float = 0.7,
         max_tokens: int = 1000,
         response_format: Optional[Dict] = None
@@ -51,13 +44,22 @@ class LLMClient:
         """
         start_time = time.time()
         
+        # ✅ PRIVACY STEP: Sanitize inputs before sending to external APIs
+        # We create a copy to avoid modifying the original memory references
+        safe_messages = []
+        for msg in messages:
+            clean_msg = msg.copy()
+            if "content" in clean_msg and isinstance(clean_msg["content"], str):
+                clean_msg["content"] = sanitizer.sanitize(clean_msg["content"])
+            safe_messages.append(clean_msg)
+
         try:
             if provider == "openai":
-                response = await self._call_openai(messages, model, temperature, max_tokens, response_format)
+                response = await self._call_openai(safe_messages, model, temperature, max_tokens, response_format)
             elif provider == "perplexity":
-                response = await self._call_perplexity(messages, model, temperature, max_tokens)
+                response = await self._call_perplexity(safe_messages, model, temperature, max_tokens)
             elif provider == "gemini":
-                response = await self._call_gemini(messages, model, temperature, max_tokens)
+                response = await self._call_gemini(safe_messages, model, temperature, max_tokens)
             else:
                 raise ValueError(f"Unsupported LLM provider: {provider}")
 
@@ -111,7 +113,6 @@ class LLMClient:
             "Authorization": f"Bearer {settings.PERPLEXITY_API_KEY}",
             "Content-Type": "application/json"
         }
-        # Fallback to a valid sonar model if user selects generic GPT model
         pplx_model = model if "sonar" in model else "sonar-medium-online"
         
         payload = {
@@ -132,16 +133,8 @@ class LLMClient:
         }
 
     async def _call_gemini(self, messages, model, temperature, max_tokens):
-        """
-        Maps OpenAI-style messages to Gemini's 'contents' format.
-        """
-        # Default to Gemini 1.5 Flash if generic model passed
         gemini_model = "gemini-2.5-flash" if "gpt" in model or "sonar" in model else model
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={settings.GEMINI_API_KEY}"
-        
-        # Transform messages:
-        # 1. System prompts -> 'system_instruction' (or prepend to first user message for compatibility)
-        # 2. User -> 'user', Assistant -> 'model'
         
         contents = []
         system_instruction = None
@@ -151,7 +144,6 @@ class LLMClient:
             content = msg["content"]
             
             if role == "system":
-                # Save system prompt to set context efficiently
                 system_instruction = {"parts": [{"text": content}]}
             elif role == "user":
                 contents.append({"role": "user", "parts": [{"text": content}]})
@@ -173,10 +165,8 @@ class LLMClient:
         resp.raise_for_status()
         data = resp.json()
         
-        # Extract text from Gemini structure
         try:
             content = data["candidates"][0]["content"]["parts"][0]["text"]
-            # Estimate usage (Gemini response metadata varies)
             usage = {"total_tokens": data.get("usageMetadata", {}).get("totalTokenCount", 0)}
         except (KeyError, IndexError):
             content = ""

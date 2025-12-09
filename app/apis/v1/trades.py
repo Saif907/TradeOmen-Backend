@@ -16,14 +16,18 @@ security = HTTPBearer()
 
 class TradeBase(BaseModel):
     symbol: str = Field(..., min_length=1, max_length=20)
+    
+    # ✅ FIX: Added instrument_type field with validation
+    instrument_type: str = Field("STOCK", pattern="^(STOCK|CRYPTO|FOREX|FUTURES)$")
+    
     direction: str = Field(..., pattern="^(?i)(Long|Short)$")
-    status: str = Field("OPEN", pattern="^(?i)(Open|Closed|Pending)$")
+    status: str = Field("OPEN", pattern="^(?i)(Open|Closed|Pending|Canceled)$")
+    
     entry_price: float = Field(..., gt=0)
     exit_price: Optional[float] = Field(None, gt=0)
     
-    # ✅ FIX: Changed 'float' to 'int' to match your DB Schema (int4)
-    # This forces 1.0 -> 1, preventing the DB error.
-    quantity: int = Field(..., gt=0)
+    # ✅ FIX: Changed 'int' to 'float' to match the new 'numeric' DB type
+    quantity: float = Field(..., gt=0)
     
     stop_loss: Optional[float] = Field(None, gt=0)
     target: Optional[float] = Field(None, gt=0)
@@ -48,6 +52,11 @@ class TradeBase(BaseModel):
     @validator('status', pre=True)
     def normalize_status(cls, v):
         return v.upper() 
+    
+    # ✅ NEW VALIDATOR: Normalize instrument type
+    @validator('instrument_type', pre=True)
+    def normalize_instrument(cls, v):
+        return v.upper()
 
 class TradeCreate(TradeBase):
     pass
@@ -99,6 +108,7 @@ def create_trade(
         return response.data[0]
     except Exception as e:
         print(f"DB Error: {e}")
+        # Note: If a DB error occurs (e.g., constraint violation), the detail should reflect it
         raise HTTPException(status_code=400, detail=f"Database Error: {str(e)}")
 
 @router.get("/", response_model=List[TradeResponse])
