@@ -3,9 +3,7 @@ from fastapi import APIRouter
 from app.apis.v1 import auth
 from app.apis.v1 import trades
 from app.apis.v1 import strategies
-
-# ✅ FIXED: Import from the .router FILE to get the router OBJECT
-# Previous wrong line: from app.apis.v1.chat import router as chat_router
+from app.apis.v1 import brokers # ✅ Import new router
 from app.apis.v1.chat.router import router as chat_router
 
 api_router = APIRouter()
@@ -21,3 +19,6 @@ api_router.include_router(strategies.router, prefix="/strategies", tags=["Strate
 
 # 4. AI Chat Router
 api_router.include_router(chat_router, prefix="/chat", tags=["AI Chat"])
+
+# 5. Brokers Router (New)
+api_router.include_router(brokers.router, prefix="/brokers", tags=["Brokers"])
