@@ -1,7 +1,7 @@
 # backend/app/lib/brokers/base.py
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any
-from datetime import datetime
+from decimal import Decimal
 
 class BrokerAdapter(ABC):
     """
@@ -20,7 +20,7 @@ class BrokerAdapter(ABC):
     @abstractmethod
     async def fetch_recent_trades(self, days: int = 30) -> List[Dict[str, Any]]:
         """
-        Fetches trades and returns them in a RAW format.
+        Fetches trades and returns them in a RAW format (broker-specific JSON).
         """
         pass
 
@@ -28,6 +28,16 @@ class BrokerAdapter(ABC):
     def normalize_trades(self, raw_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Converts broker-specific raw data into our TradeOmen 'Trade' dictionary format.
-        Mapping: 'Symbol' -> 'symbol', 'BuyPrice' -> 'entry_price', etc.
+        
+        CRITICAL: Financial fields MUST be converted to Decimal.
+        
+        Expected Output Keys:
+        - symbol: str (Uppercase)
+        - direction: str ("Long" or "Short")
+        - entry_price: Decimal
+        - quantity: Decimal
+        - fees: Decimal
+        - entry_time: str (ISO 8601)
+        - status: str ("CLOSED" for spot/filled orders)
         """
         pass
