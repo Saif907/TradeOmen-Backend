@@ -143,7 +143,6 @@ async def analyze_file(
         supabase.storage.from_("temp-imports").upload(file_path, content)
         
         # 3. Analyze Structure (Headers + Sample)
-        # ✅ FIX: Use analyze_structure to get sample data for better mapping
         structure = csv_parser.analyze_structure(content)
         
         # 4. Generate Mapping via LLM
@@ -195,6 +194,7 @@ async def confirm_import(
                 if "status" not in raw_trade:
                     raw_trade["status"] = "CLOSED" if raw_trade.get("exit_price") else "OPEN"
                 
+                # TradeCreate (Pydantic) converts Decimals -> floats AND converts "Long" -> "LONG"
                 trade_model = TradeCreate(**raw_trade)
                 db_row = serialize_for_db(trade_model.dict(exclude={"notes"}))
                 
@@ -203,9 +203,11 @@ async def confirm_import(
                 
                 db_row["user_id"] = user_id
                 
+                # --- PnL Calculation ---
                 if "pnl" not in db_row or db_row["pnl"] is None:
                     if trade_model.exit_price and trade_model.exit_price > 0:
-                        mult = Decimal("1") if trade_model.direction == "Long" else Decimal("-1")
+                        # ✅ FIX: Direction is now UPPERCASE "LONG"
+                        mult = 1.0 if trade_model.direction == "LONG" else -1.0
                         pnl = (trade_model.exit_price - trade_model.entry_price) * trade_model.quantity * mult - trade_model.fees
                         db_row["pnl"] = str(pnl) 
 
@@ -266,7 +268,6 @@ async def confirm_import(
         raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
 
 # --- Main Chat Handler ---
-# (chat_with_ai function remains unchanged)
 @router.post("", response_model=ChatResponse)
 async def chat_with_ai(
     request: ChatRequest,

@@ -397,14 +397,15 @@ class CSVParser:
                     metadata[col] = str(val).strip()
 
             # Direction normalization
+            # ✅ FIX: Normalized to UPPERCASE "LONG" / "SHORT"
             if "direction" in trade:
                 d = str(trade["direction"]).strip().upper()
                 if d in DIRECTION_POSITIVE:
-                    trade["direction"] = "Long"
+                    trade["direction"] = "LONG"
                 elif d in DIRECTION_NEGATIVE:
-                    trade["direction"] = "Short"
+                    trade["direction"] = "SHORT"
                 else:
-                    trade["direction"] = trade["direction"].capitalize()
+                    trade["direction"] = trade["direction"].upper()
 
             # Instrument type normalization: preserve raw in metadata and set canonical or None
             if "instrument_type" in trade:
@@ -461,5 +462,3 @@ class CSVParser:
 
 # Single instance
 csv_parser = CSVParser()
-
-

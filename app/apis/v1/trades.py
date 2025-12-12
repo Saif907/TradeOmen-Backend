@@ -20,8 +20,9 @@ logger = logging.getLogger(__name__)
 class TradeBase(BaseModel):
     symbol: str = Field(..., min_length=1, max_length=20)
     instrument_type: str = Field("STOCK", pattern="^(STOCK|CRYPTO|FOREX|FUTURES)$")
-    direction: str = Field(..., pattern="^(?i)(Long|Short)$")
-    status: str = Field("OPEN", pattern="^(?i)(Open|Closed|Pending|Canceled)$")
+    # ✅ FIX: Changed regex to UPPERCASE matching
+    direction: str = Field(..., pattern="^(?i)(LONG|SHORT)$")
+    status: str = Field("OPEN", pattern="^(?i)(OPEN|CLOSED|PENDING|CANCELED)$")
     entry_price: float = Field(..., gt=0)
     exit_price: Optional[float] = Field(None, gt=0)
     quantity: float = Field(..., gt=0)
@@ -42,7 +43,8 @@ class TradeBase(BaseModel):
 
     @validator('direction', pre=True)
     def normalize_direction(cls, v):
-        return v.title() 
+        # ✅ FIX: Enforce UPPERCASE (Long -> LONG)
+        return v.upper() 
 
     @validator('status', pre=True)
     def normalize_status(cls, v):
@@ -80,7 +82,8 @@ class TradeUpdate(BaseModel):
 
     @validator('direction', pre=True)
     def normalize_direction(cls, v):
-        return v.title() if v else None
+        # ✅ FIX: Enforce UPPERCASE here too
+        return v.upper() if v else None
 
 class TradeResponse(TradeBase):
     id: str
@@ -111,7 +114,8 @@ def create_trade(
 
     pnl = None
     if trade.exit_price and trade.exit_price > 0:
-        mult = 1 if trade.direction == "Long" else -1
+        # ✅ FIX: Update PnL logic for UPPERCASE
+        mult = 1 if trade.direction == "LONG" else -1
         pnl = (float(trade.exit_price) - float(trade.entry_price)) * float(trade.quantity) * mult - float(trade.fees)
 
     trade_data = trade.dict(exclude={"notes"}) # Exclude alias
@@ -178,9 +182,10 @@ def update_trade(
                 entry_p = float(merged.get("entry_price") or 0)
                 qty = float(merged.get("quantity") or 0)
                 fees = float(merged.get("fees") or 0)
-                direction = merged.get("direction", "Long")
+                # ✅ FIX: Direction default and check
+                direction = merged.get("direction", "LONG").upper()
                 
-                mult = 1 if direction == "Long" else -1
+                mult = 1 if direction == "LONG" else -1
                 new_pnl = (exit_p - entry_p) * qty * mult - fees
                 
                 update_data["pnl"] = new_pnl
