@@ -19,6 +19,10 @@ class Settings(BaseSettings):
 
     SERVER_HOST: str = "0.0.0.0"
     SERVER_PORT: int = 8000
+    
+    # URL to redirect the user back to after OAuth success
+    # Dev: http://localhost:5173/settings
+    FRONTEND_URL: str = "http://localhost:5173" 
 
     CORS_ALLOWED_ORIGINS: List[str] = [
         "http://localhost:5173", 
@@ -36,20 +40,26 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str
 
-    # --- SECURITY SETTINGS (These were missing) ---
+    # Security
     SECRET_KEY: str
-    ALGORITHM: str = "HS256"  # Default for Supabase JWTs
-    ENCRYPTION_KEY: str       # Used by app/lib/encryption.py
+    ALGORITHM: str = "HS256"
+    ENCRYPTION_KEY: str
 
-    # LLM Settings
+    # LLM Keys
     OPENAI_API_KEY: Optional[str] = None
     GEMINI_API_KEY: Optional[str] = None
-    PERPLEXITY_API_KEY: Optional[str] = None # Added based on your requirements.txt
+    PERPLEXITY_API_KEY: Optional[str] = None
 
     LLM_MODEL: str = "gpt-4-turbo"
     LLM_PROVIDER: str = "openai"
     
-    # Worker Settings
     MAX_WORKER_THREADS: int = 8
+
+    # --- DHAN OAUTH CREDENTIALS ---
+    DHAN_CLIENT_ID: Optional[str] = None
+    DHAN_CLIENT_SECRET: Optional[str] = None
+    # Must match EXACTLY what you registered with Dhan
+    # Example: http://localhost:8000/api/v1/brokers/dhan/callback
+    DHAN_REDIRECT_URI: Optional[str] = None 
 
 settings = Settings()

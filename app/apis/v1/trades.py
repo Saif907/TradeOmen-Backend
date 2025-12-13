@@ -1,6 +1,6 @@
 # backend/app/apis/v1/trades.py
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status, Body
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field, validator
@@ -9,6 +9,8 @@ from supabase import create_client, Client
 
 from app.core.config import settings
 from app.auth.dependency import get_current_user
+# ✅ Import the new service
+from app.services.analytics import AnalyticsService
 
 # --- Configuration & Logging ---
 router = APIRouter()
@@ -20,7 +22,6 @@ logger = logging.getLogger(__name__)
 class TradeBase(BaseModel):
     symbol: str = Field(..., min_length=1, max_length=20)
     instrument_type: str = Field("STOCK", pattern="^(STOCK|CRYPTO|FOREX|FUTURES)$")
-    # ✅ FIX: Changed regex to UPPERCASE matching
     direction: str = Field(..., pattern="^(?i)(LONG|SHORT)$")
     status: str = Field("OPEN", pattern="^(?i)(OPEN|CLOSED|PENDING|CANCELED)$")
     entry_price: float = Field(..., gt=0)
@@ -32,7 +33,7 @@ class TradeBase(BaseModel):
     exit_time: Optional[datetime] = None
     fees: float = Field(0.0, ge=0)
     encrypted_notes: Optional[str] = None
-    notes: Optional[str] = None # Alias for encrypted_notes in payload
+    notes: Optional[str] = None
     encrypted_screenshots: Optional[List[str]] = []
     strategy_id: Optional[str] = None
     tags: Optional[List[str]] = []
@@ -43,7 +44,6 @@ class TradeBase(BaseModel):
 
     @validator('direction', pre=True)
     def normalize_direction(cls, v):
-        # ✅ FIX: Enforce UPPERCASE (Long -> LONG)
         return v.upper() 
 
     @validator('status', pre=True)
@@ -58,9 +58,6 @@ class TradeCreate(TradeBase):
     pass
 
 class TradeUpdate(BaseModel):
-    """
-    Partial update model. All fields are optional.
-    """
     symbol: Optional[str] = None
     instrument_type: Optional[str] = None
     direction: Optional[str] = None
@@ -82,7 +79,6 @@ class TradeUpdate(BaseModel):
 
     @validator('direction', pre=True)
     def normalize_direction(cls, v):
-        # ✅ FIX: Enforce UPPERCASE here too
         return v.upper() if v else None
 
 class TradeResponse(TradeBase):
@@ -90,7 +86,6 @@ class TradeResponse(TradeBase):
     user_id: str
     pnl: Optional[float]
     created_at: str
-    # Map 'notes' back to frontend if needed, usually just sent as encrypted_notes
     notes: Optional[str] = Field(None, alias="encrypted_notes")
 
 # --- Dependency ---
@@ -103,6 +98,33 @@ def get_authenticated_client(creds: HTTPAuthorizationCredentials = Depends(secur
 
 # --- Endpoints ---
 
+@router.get("/dashboard")
+def get_dashboard_stats(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    supabase: Client = Depends(get_authenticated_client)
+):
+    """
+    Returns aggregated trading statistics for the dashboard.
+    Delegates heavy calculation to the AnalyticsService.
+    """
+    user_id = current_user["sub"]
+    
+    try:
+        # 1. Fetch raw trade data
+        # Note: We fetch 'strategies' too if we want to map names in the service later
+        response = supabase.table("trades").select("*").eq("user_id", user_id).execute()
+        trades_data = response.data
+        
+        # 2. Pass to Analytics Engine
+        analytics = AnalyticsService(trades_data)
+        
+        # 3. Return computed stats
+        return analytics.get_dashboard_stats()
+
+    except Exception as e:
+        logger.error(f"Dashboard Stats Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to calculate dashboard statistics")
+
 @router.post("/", response_model=TradeResponse, status_code=status.HTTP_201_CREATED)
 def create_trade(
     trade: TradeCreate, 
@@ -114,11 +136,10 @@ def create_trade(
 
     pnl = None
     if trade.exit_price and trade.exit_price > 0:
-        # ✅ FIX: Update PnL logic for UPPERCASE
-        mult = 1 if trade.direction == "LONG" else -1
+        mult = 1.0 if trade.direction == "LONG" else -1.0
         pnl = (float(trade.exit_price) - float(trade.entry_price)) * float(trade.quantity) * mult - float(trade.fees)
 
-    trade_data = trade.dict(exclude={"notes"}) # Exclude alias
+    trade_data = trade.dict(exclude={"notes"})
     if trade.notes: trade_data["encrypted_notes"] = trade.notes
     
     trade_data["pnl"] = pnl
@@ -143,63 +164,48 @@ def update_trade(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    """
-    Update an existing trade. 
-    Smartly recalculates PnL if price/quantity/exit fields change.
-    """
     user_id = current_user["sub"]
     
     try:
-        # 1. Fetch Existing Trade (Secure Check)
         existing_res = supabase.table("trades").select("*").eq("id", trade_id).eq("user_id", user_id).execute()
         if not existing_res.data:
             raise HTTPException(status_code=404, detail="Trade not found or access denied")
         
         existing_trade = existing_res.data[0]
         
-        # 2. Prepare Update Data
-        # Filter out None values to only update what was sent
         update_data = {k: v for k, v in updates.dict(exclude={"notes"}).items() if v is not None}
         if updates.notes is not None:
              update_data["encrypted_notes"] = updates.notes
 
-        # 3. Handle Dates Serialization
         if "entry_time" in update_data:
              update_data["entry_time"] = update_data["entry_time"].isoformat()
         if "exit_time" in update_data:
              update_data["exit_time"] = update_data["exit_time"].isoformat()
 
-        # 4. Smart PnL Recalculation
-        # We merge existing data with updates to get the "full picture" for calculation
         merged = {**existing_trade, **update_data}
         
         should_recalc = any(k in update_data for k in ["entry_price", "exit_price", "quantity", "direction", "fees"])
         
         if should_recalc:
-            # Check if we have enough info to calc PnL (needs exit price)
             exit_p = float(merged.get("exit_price") or 0)
             if exit_p > 0:
                 entry_p = float(merged.get("entry_price") or 0)
                 qty = float(merged.get("quantity") or 0)
                 fees = float(merged.get("fees") or 0)
-                # ✅ FIX: Direction default and check
                 direction = merged.get("direction", "LONG").upper()
                 
-                mult = 1 if direction == "LONG" else -1
+                mult = 1.0 if direction == "LONG" else -1.0
                 new_pnl = (exit_p - entry_p) * qty * mult - fees
                 
                 update_data["pnl"] = new_pnl
                 
-                # Auto-update status if not explicitly sent
                 if "status" not in update_data:
                      update_data["status"] = "CLOSED"
             else:
-                # If exit price removed or 0, clear PnL
                 update_data["pnl"] = None
                 if "status" not in update_data:
                      update_data["status"] = "OPEN"
 
-        # 5. Execute Update
         response = supabase.table("trades").update(update_data).eq("id", trade_id).execute()
         
         if not response.data:
