@@ -21,6 +21,7 @@ from .services import (
     build_memory_context, 
     build_trading_context
 )
+from app.core.config import settings
 
 # --- Configuration & Logging ---
 router = APIRouter()
@@ -277,23 +278,45 @@ async def chat_with_ai(
 ):
     user_id = current_user["sub"]
     session_id = request.session_id
+    
+    # ✅ DETECT WEB SEARCH INTENT
+    is_web_search = False
+    raw_message = request.message
+    
+    # Use config default unless request specifies otherwise
+    target_provider = getattr(request, "provider", settings.LLM_PROVIDER)
+    target_model = request.model
+
+    if "[WEB SEARCH]" in raw_message:
+        is_web_search = True
+        # Clean the message for processing and storage
+        raw_message = raw_message.replace("[WEB SEARCH]", "").strip()
+        # Force Perplexity
+        target_provider = "perplexity"
+        target_model = "sonar"
+        logger.info(f"🌐 Web Search activated for user {user_id}")
+
     is_new_session = False
 
     try:
         if not session_id:
             is_new_session = True
-            initial_topic = (request.message[:45] + "...") if len(request.message) > 45 else request.message
+            # Create session with the CLEANED message
+            initial_topic = (raw_message[:45] + "...") if len(raw_message) > 45 else raw_message
             sess_res = supabase.table("chat_sessions").insert({"user_id": user_id, "topic": initial_topic}).execute()
             if not sess_res.data: raise HTTPException(500, "Failed to create session")
             session_id = sess_res.data[0]["id"]
-            background_tasks.add_task(generate_session_title, session_id, request.message, supabase)
+            background_tasks.add_task(generate_session_title, session_id, raw_message, supabase)
 
-        trade_proposal = await parse_trade_intent(request.message)
+        # Skip trade parsing if explicit web search is requested
+        trade_proposal = None
+        if not is_web_search:
+            trade_proposal = await parse_trade_intent(raw_message)
         
         if trade_proposal:
             logger.info(f"Trade intent detected for session {session_id}")
             supabase.table("chat_messages").insert({
-                "session_id": session_id, "user_id": user_id, "role": "user", "encrypted_content": request.message
+                "session_id": session_id, "user_id": user_id, "role": "user", "encrypted_content": raw_message
             }).execute()
             ai_response_text = "I've drafted this trade based on your message. Please review and confirm."
             supabase.table("chat_messages").insert({
@@ -308,26 +331,32 @@ async def chat_with_ai(
             }
 
         memory = build_memory_context(session_id, supabase) if not is_new_session else []
+        
+        # Build RAG Context
         rag_context = build_trading_context(supabase)
         
         system_prompt = f"""You are TradeLM, a professional trading assistant.
         User Context:
         {rag_context}
-        CRITICAL INSTRUCTION:
-        - If the user asks to log a trade, and you are seeing this prompt, it means the auto-logger FAILED.
-        - DO NOT fake a confirmation.
+        
+        INSTRUCTIONS:
+        - You have access to the user's recent trade history and strategies above.
+        - If 'Web Search' is active, use the latest data provided by your underlying model.
         """
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(memory)
-        messages.append({"role": "user", "content": request.message})
+        messages.append({"role": "user", "content": raw_message})
 
+        # ✅ CALL LLM with correct provider
         ai_result = await llm_client.generate_response(
-            messages=messages, model=request.model, provider=request.provider
+            messages=messages, 
+            model=target_model, 
+            provider=target_provider
         )
         
         msgs = [
-            {"session_id": session_id, "user_id": user_id, "role": "user", "encrypted_content": request.message},
+            {"session_id": session_id, "user_id": user_id, "role": "user", "encrypted_content": raw_message},
             {"session_id": session_id, "user_id": user_id, "role": "assistant", "encrypted_content": ai_result["content"]}
         ]
         supabase.table("chat_messages").insert(msgs).execute()

@@ -5,6 +5,8 @@ from app.apis.v1 import trades
 from app.apis.v1 import strategies
 from app.apis.v1 import brokers # ✅ Import new router
 from app.apis.v1.chat.router import router as chat_router
+from app.apis.v1 import news
+
 
 api_router = APIRouter()
 
@@ -22,3 +24,5 @@ api_router.include_router(chat_router, prefix="/chat", tags=["AI Chat"])
 
 # 5. Brokers Router (New)
 api_router.include_router(brokers.router, prefix="/brokers", tags=["Brokers"])
+
+api_router.include_router(news.router, prefix="/news", tags=["News"])

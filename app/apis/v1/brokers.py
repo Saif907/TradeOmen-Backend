@@ -17,6 +17,7 @@ from app.auth.dependency import get_current_user
 from app.lib.encryption import crypto
 from app.lib.brokers.factory import get_broker_adapter
 from app.lib.brokers.dhan import DhanAdapter
+from urllib.parse import quote
 
 router = APIRouter()
 security = HTTPBearer()
@@ -143,24 +144,24 @@ def _validate_state_for_user(state: str, expected_user_id: str) -> bool:
 def get_dhan_auth_url(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """
-    Returns a signed Dhan OAuth authorization URL for the current user (stateful).
-    """
     if not settings.DHAN_CLIENT_ID or not settings.DHAN_REDIRECT_URI:
         raise HTTPException(status_code=500, detail="Dhan not configured on server")
 
     user_id = current_user["sub"]
     state = _build_state_for_user(user_id)
 
-    # Construct the authorize URL; avoid relying on /v2 for authorize endpoint.
-    # Use plain domain authorize and token endpoint with /v2.
+    # ✅ URL-ENCODE redirect URI (THIS WAS MISSING)
+    encoded_redirect = quote(settings.DHAN_REDIRECT_URI, safe="")
+
     authorize_url = (
-        f"https://api.dhan.co/oauth/authorize?"
-        f"client_id={settings.DHAN_CLIENT_ID}&"
-        f"redirect_uri={settings.DHAN_REDIRECT_URI}&"
-        f"state={state}"
+        "https://dhan.co/login"
+        f"?clientId={settings.DHAN_CLIENT_ID}"
+        f"&redirectUri={encoded_redirect}"
+        f"&state={state}"
     )
+
     return {"url": authorize_url}
+
 
 
 @router.get("/dhan/callback")

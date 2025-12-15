@@ -7,7 +7,6 @@ import time
 import json
 
 from app.core.config import settings
-# ✅ NEW IMPORT: Privacy Sanitizer
 from app.lib.data_sanitizer import sanitizer 
 
 logger = logging.getLogger(__name__)
@@ -20,7 +19,8 @@ class LLMClient:
     
     def __init__(self):
         # Shared async client for connection pooling
-        self.client = httpx.AsyncClient(timeout=60.0)
+        # Explicitly trust_env=False to ignore potentially malformed system proxy settings during dev
+        self.client = httpx.AsyncClient(timeout=60.0, trust_env=True)
         
     async def close(self):
         await self.client.aclose()
@@ -44,8 +44,7 @@ class LLMClient:
         """
         start_time = time.time()
         
-        # ✅ PRIVACY STEP: Sanitize inputs before sending to external APIs
-        # We create a copy to avoid modifying the original memory references
+        # ✅ PRIVACY STEP: Sanitize inputs
         safe_messages = []
         for msg in messages:
             clean_msg = msg.copy()
@@ -73,6 +72,9 @@ class LLMClient:
                 "provider": provider
             }
 
+        except httpx.UnsupportedProtocol as e:
+            logger.critical(f"🚨 Protocol Error calling {provider}: {str(e)}")
+            raise HTTPException(status_code=500, detail="Internal Configuration Error: Invalid API URL")
         except httpx.HTTPStatusError as e:
             logger.error(f"LLM Provider Error ({provider}): {e.response.status_code} - {e.response.text}")
             raise e
@@ -113,8 +115,15 @@ class LLMClient:
             "Authorization": f"Bearer {settings.PERPLEXITY_API_KEY}",
             "Content-Type": "application/json"
         }
-        pplx_model = model if "sonar" in model else "sonar-medium-online"
         
+        # ✅ Logic to handle 'sonar' model request
+        if model == "sonar":
+            pplx_model = "sonar" # Use the generic latest model
+        elif "sonar" in model:
+            pplx_model = model
+        else:
+            pplx_model = "sonar-medium-online" # Fallback
+            
         payload = {
             "model": pplx_model,
             "messages": messages,
@@ -122,6 +131,7 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
 
+        logger.info(f"📤 Calling Perplexity API: {url} with model {pplx_model}")
         resp = await self.client.post(url, headers=headers, json=payload)
         resp.raise_for_status()
         data = resp.json()
@@ -134,8 +144,18 @@ class LLMClient:
 
     async def _call_gemini(self, messages, model, temperature, max_tokens):
         gemini_model = "gemini-2.5-flash" if "gpt" in model or "sonar" in model else model
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={settings.GEMINI_API_KEY}"
         
+        # Ensure Key is present
+        api_key = settings.GEMINI_API_KEY
+        if not api_key:
+            logger.error("❌ GEMINI_API_KEY is missing!")
+            raise ValueError("GEMINI_API_KEY is not set")
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={api_key}"
+        
+        # Clean URL (just in case of whitespace injection)
+        url = url.strip()
+
         contents = []
         system_instruction = None
         
@@ -161,6 +181,8 @@ class LLMClient:
         if system_instruction:
             payload["systemInstruction"] = system_instruction
 
+        logger.info(f"📤 Calling Gemini API: {url.split('?')[0]}...") # Log without key
+        
         resp = await self.client.post(url, json=payload)
         resp.raise_for_status()
         data = resp.json()

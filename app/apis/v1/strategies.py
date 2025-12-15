@@ -1,10 +1,11 @@
 # backend/app/apis/v1/strategies.py
 import logging
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
-from datetime import datetime
+from pydantic import BaseModel, Field, field_validator
 from supabase import create_client, Client
 
 from app.core.config import settings
@@ -24,8 +25,6 @@ class StrategyBase(BaseModel):
     color_hex: str = Field("#8b5cf6", pattern="^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$")
     style: Optional[str] = Field(None, description="Day Trading, Swing, etc.")
     instrument_types: List[str] = []
-    # Rules is a flexible Dictionary to support custom groups
-    # Example: {"Market": ["Trend Up"], "Psychology": ["No FOMO"]}
     rules: Dict[str, List[str]] = Field(default_factory=dict)
     track_missed_trades: bool = True
 
@@ -43,20 +42,16 @@ class StrategyUpdate(BaseModel):
     track_missed_trades: Optional[bool] = None
 
 class StrategyResponse(StrategyBase):
-    id: str # UUID
+    id: str
     user_id: str
     created_at: datetime
-    updated_at: datetime
+    # ✅ FIX: Made Optional to prevent crashes on legacy data
+    updated_at: Optional[datetime] = None 
 
-# --- Dependency: Authenticated Supabase Client ---
+# --- Dependency ---
 
 def get_authenticated_client(creds: HTTPAuthorizationCredentials = Depends(security)) -> Client:
-    """
-    Creates a Supabase client authenticating AS THE USER.
-    This ensures RLS policies are automatically enforced.
-    """
     token = creds.credentials
-    # Initialize with Service Role Key but Scope to User Token
     client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
     client.postgrest.auth(token)
     return client
@@ -69,27 +64,15 @@ def create_strategy(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    """
-    Create a new trading strategy/playbook.
-    """
-    # OPTIMIZATION: Use the locally decoded JWT user_id instead of calling Supabase Auth API
     user_id = current_user["sub"]
-    
-    logger.info(f"User {user_id} creating strategy: {strategy.name}")
-        
     data = strategy.dict()
     data["user_id"] = user_id
     
     try:
-        # Insert into Supabase
         response = supabase.table("strategies").insert(data).execute()
-        
         if not response.data:
-            logger.error(f"Strategy creation returned no data for user {user_id}")
             raise HTTPException(status_code=400, detail="Failed to create strategy")
-            
         return response.data[0]
-        
     except Exception as e:
         logger.error(f"DB Error creating strategy: {e}")
         raise HTTPException(status_code=400, detail=f"Database Error: {str(e)}")
@@ -99,19 +82,12 @@ def get_strategies(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    """
-    List all strategies for the current user.
-    RLS ensures users only see their own strategies.
-    """
     try:
-        response = supabase.table("strategies")\
-            .select("*")\
-            .order("name", desc=False)\
-            .execute()
-            
+        # ✅ FIX: Fetch strategies without crashing if updated_at is null
+        response = supabase.table("strategies").select("*").order("name", desc=False).execute()
         return response.data
     except Exception as e:
-        logger.error(f"Error fetching strategies for {current_user['sub']}: {e}")
+        logger.error(f"Error fetching strategies: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch strategies")
 
 @router.get("/{strategy_id}", response_model=StrategyResponse)
@@ -120,15 +96,10 @@ def get_strategy(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    """
-    Get a specific strategy by ID.
-    """
     try:
         response = supabase.table("strategies").select("*").eq("id", strategy_id).execute()
-        
         if not response.data:
             raise HTTPException(status_code=404, detail="Strategy not found")
-            
         return response.data[0]
     except HTTPException:
         raise
@@ -143,29 +114,17 @@ def update_strategy(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    """
-    Update a strategy.
-    """
-    # Filter out None values to only update fields that were sent
     update_data = {k: v for k, v in strategy.dict().items() if v is not None}
-    
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
     update_data["updated_at"] = datetime.now().isoformat()
 
     try:
-        response = supabase.table("strategies")\
-            .update(update_data)\
-            .eq("id", strategy_id)\
-            .execute()
-        
+        response = supabase.table("strategies").update(update_data).eq("id", strategy_id).execute()
         if not response.data:
             raise HTTPException(status_code=404, detail="Strategy not found or not authorized")
-            
-        logger.info(f"Strategy {strategy_id} updated by {current_user['sub']}")
         return response.data[0]
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -178,21 +137,11 @@ def delete_strategy(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    """
-    Delete a strategy.
-    """
     try:
         response = supabase.table("strategies").delete().eq("id", strategy_id).execute()
-        
-        # Supabase delete returns the rows deleted. If empty, it means nothing happened (not found/auth).
         if not response.data:
-            raise HTTPException(status_code=404, detail="Strategy not found or not authorized")
-        
-        logger.info(f"Strategy {strategy_id} deleted by {current_user['sub']}")
+            raise HTTPException(status_code=404, detail="Strategy not found")
         return None
-        
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error deleting strategy {strategy_id}: {e}")
-        raise HTTPException(status_code=500, detail="Deletion failed")
+        raise HTTPException(status_code=500, detail="Deletion failed") 

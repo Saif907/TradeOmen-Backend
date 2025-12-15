@@ -106,6 +106,59 @@ async def parse_trade_intent(message: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.error(f"Trade parsing failed: {e}")
         return None
+    
+async def parse_news_intent(message: str) -> Optional[str]:
+    """
+    Detects if the user wants News/Research/Market Data.
+    Returns the optimized search query if yes, None otherwise.
+    """
+    system_prompt = """
+    You are an Intent Classifier for a Trading Terminal.
+    Your job is to route queries to a Real-Time Search Engine (Perplexity) vs General AI (Gemini).
+
+    ROUTE TO SEARCH (Perplexity) IF:
+    - User asks for "news", "headlines", "events", "catalysts".
+    - User asks "what happened to [Asset]?", "why is [Asset] down/up?".
+    - User asks for current data: "price of BTC", "Fed rate", "earnings date".
+    - User uses keywords: "Check news", "Search for", "Research", "Find info on".
+    - User asks for recent market trends or summaries. 
+    - User can ask about anything related to real-time or recent information. 
+    
+    ROUTE TO GENERAL AI (Gemini) IF:
+    - User asks for code, definitions, generic trading advice ("what is a stop loss?").
+    - User greets ("hi", "hello") or asks about the system itself.
+    - User asks to log a trade (handled by separate intent).
+
+    Example 1: "check news for tesla" -> {"search_query": "Tesla stock news today catalysts"}
+    Example 2: "why is crypto crashing" -> {"search_query": "reasons for crypto market crash today"}
+    Example 3: "write a python script" -> {"search_query": null}
+
+    Return JSON ONLY: { "search_query": string | null }
+    """
+
+    try:
+        response = await llm_client.generate_response(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": message}
+            ],
+            model="gemini-2.5-flash", # Fast router
+            provider="gemini",
+            response_format={"type": "json_object"}
+        )
+        
+        data = json.loads(response["content"])
+        query = data.get("search_query")
+        
+        if query:
+            logger.info(f"🔀 Routing to Perplexity: {query}")
+            return query
+            
+        return None
+    except Exception as e:
+        logger.warning(f"News intent detection failed: {e}")
+        return None
+    
 
 def build_memory_context(session_id: str, supabase: Client, limit: int = 10) -> List[Dict[str, str]]:
     """

@@ -131,6 +131,54 @@ def normalize_instrument_type(raw: Any) -> Optional[str]:
 
     return None
 
+def infer_instrument_from_symbol(symbol: str, rules: List[Dict[str, str]] = None) -> str:
+    """
+    Heuristic Fallback: Deduce instrument type from the Ticker Symbol itself
+    when the CSV lacks an explicit 'instrument_type' column.
+    
+    Now supports dynamic user-defined 'rules'.
+    Rule Format: {"keyword": "FUT", "type": "FUTURES", "match": "CONTAINS"}
+    """
+    if not symbol:
+        return "STOCK"
+        
+    s = str(symbol).strip().upper()
+    
+    # 0. Apply User-Defined Rules (Priority)
+    if rules:
+        for rule in rules:
+            keyword = rule.get("keyword", "").upper()
+            target_type = rule.get("type", "STOCK").upper()
+            if not keyword: continue
+            
+            # Simple "contains" logic for now
+            if keyword in s:
+                return target_type
+
+    # 1. CRYPTO Detection
+    if re.search(r'(USDT|BUSD|USDC|BTC|ETH)$', s) and len(s) > 3:
+        return "CRYPTO"
+    if re.search(r'^[A-Z0-9]{2,5}[-/][A-Z0-9]{2,5}$', s):
+        if any(c in s for c in ["USD", "EUR", "GBP", "JPY", "BTC", "ETH"]):
+            return "CRYPTO"
+
+    # 2. DERIVATIVES (Futures/Options) Detection
+    if re.search(r'(CE|PE|CALL|PUT)$', s):
+        return "FUTURES" 
+    
+    if re.search(r'(\b|_)FUT\b', s) or s.endswith("FUT") or "&" in s:
+        return "FUTURES"
+
+    # 3. FOREX Detection
+    majors = {"EUR", "USD", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD"}
+    clean_s = s.replace("/", "").replace("-", "")
+    if len(clean_s) == 6:
+        base, quote = clean_s[:3], clean_s[3:]
+        if base in majors and quote in majors:
+            return "FOREX"
+
+    return "STOCK"
+
 
 # -------------------------
 # CSV Parser
@@ -147,16 +195,18 @@ class CSVParser:
     # ---------------
     # Structure analysis
     # ---------------
-    def analyze_structure(self, file_content: bytes, peek_rows: int = 5) -> Dict[str, Any]:
+    # ✅ UPDATED: Changed default peek_rows from 5 to 10
+    def analyze_structure(self, file_content: bytes, peek_rows: int = 10) -> Dict[str, Any]:
         """
-        Return {"headers": [...], "sample": [...], "has_header": bool}
-        If headerless, headers are Column_0..Column_N.
+        Return {"headers": [...], "sample": [...], "preview": [...], "has_header": bool}
         """
         try:
-            df_peek = pd.read_csv(io.BytesIO(file_content), nrows=peek_rows, header=None, dtype=str)
+            # Read a slightly larger chunk to ensure we have enough rows for stats + preview
+            df_peek = pd.read_csv(io.BytesIO(file_content), nrows=peek_rows + 2, header=None, dtype=str)
             df_peek = df_peek.dropna(how="all")
+            
             if df_peek.empty:
-                return {"headers": [], "sample": [], "has_header": True}
+                return {"headers": [], "sample": [], "preview": [], "has_header": True}
 
             first = df_peek.iloc[0].astype(str).tolist()
             second = df_peek.iloc[1].astype(str).tolist() if len(df_peek) > 1 else []
@@ -168,29 +218,47 @@ class CSVParser:
                 )
 
             first_date_count, first_num_count = stats(first)
-            second_date_count, second_num_count = stats(second) if second else (0, 0)
-
+            
             num_cols = len(first)
             first_rate = (first_date_count + first_num_count) / max(1, num_cols)
-            second_rate = (second_date_count + second_num_count) / max(1, num_cols)
 
             # conservative: if first row largely numeric/date => headerless
             has_header = not (first_rate >= 0.6)
+            
+            headers = []
+            preview_data = []
 
             if not has_header:
-                df = pd.read_csv(io.BytesIO(file_content), header=None, dtype=str)
+                # Reload with header=None to keep the first row as data
+                df = pd.read_csv(io.BytesIO(file_content), nrows=peek_rows, header=None, dtype=str)
+                df = df.fillna("")
                 headers = [f"Column_{i}" for i in range(len(df.columns))]
+                # Set columns for easy dict conversion
+                df.columns = headers
+                preview_data = df.to_dict(orient="records")
+                
+                # Sample is just the first row values
                 sample = df.iloc[0].astype(str).tolist() if not df.empty else []
                 logger.info("Detected headerless CSV; using generated Column_X headers.")
             else:
-                df_full = pd.read_csv(io.BytesIO(file_content), dtype=str)
-                headers = list(df_full.columns)
-                sample = df_full.iloc[0].astype(str).tolist() if not df_full.empty else []
+                # Reload with header=0 to parse first row as header
+                df = pd.read_csv(io.BytesIO(file_content), nrows=peek_rows, dtype=str)
+                df = df.fillna("")
+                headers = list(df.columns)
+                preview_data = df.to_dict(orient="records")
+                
+                # Sample is the first data row
+                sample = df.iloc[0].astype(str).tolist() if not df.empty else []
 
-            return {"headers": headers, "sample": sample, "has_header": has_header}
+            return {
+                "headers": headers, 
+                "sample": sample, 
+                "preview": preview_data, 
+                "has_header": has_header
+            }
         except Exception:
             logger.exception("analyze_structure failed")
-            return {"headers": [], "sample": [], "has_header": True}
+            return {"headers": [], "sample": [], "preview": [], "has_header": True}
 
     def read_headers(self, file_content: bytes) -> List[str]:
         return self.analyze_structure(file_content)["headers"]
@@ -198,15 +266,26 @@ class CSVParser:
     # ---------------
     # LLM mapping w/ retries & JSON extraction
     # ---------------
-    async def guess_mapping(self, headers: List[str], sample_row: List[str], user_prompt: str = "") -> Dict[str, str]:
+    async def guess_mapping(self, headers: List[str], sample_row: List[str], user_prompt: str = "") -> Dict[str, Any]:
         """
-        Ask LLM to map CSV headers -> TARGET_SCHEMA. Falls back to heuristics on failure.
-        Returns mapping: { target_field: csv_header_name }
+        Ask LLM to map CSV headers -> TARGET_SCHEMA. 
+        Also extracts 'custom_rules' from user_prompt.
+        
+        Returns: { 
+            "mapping": { target_field: csv_header_name }, 
+            "rules": [ { "keyword": "FUT", "type": "FUTURES" } ] 
+        }
         """
         system_instruction = (
             "You are a Data Mapping Specialist. Map the user's CSV columns to the Target Schema.\n"
             f"Target Schema: {json.dumps(TARGET_SCHEMA)}\n\n"
-            "Output JSON only: e.g. {\"symbol\":\"Column_2\",\"entry_price\":\"price\"}. Omit uncertain fields."
+            "CRITICAL: If the user provides specific logic (e.g., 'symbols with FUT are Futures'), extract them into 'instrument_rules'.\n"
+            "Supported Instrument Types: STOCK, CRYPTO, FOREX, FUTURES.\n\n"
+            "Output JSON format:\n"
+            "{\n"
+            "  \"mapping\": {\"symbol\":\"Column_2\", \"entry_price\":\"price\"},\n"
+            "  \"instrument_rules\": [{\"keyword\": \"FUT\", \"type\": \"FUTURES\"}]\n"
+            "}"
         )
         user_message = f"Headers: {json.dumps(headers)}\nSample Data: {json.dumps(sample_row)}\nUser Note: {user_prompt}"
 
@@ -240,25 +319,38 @@ class CSVParser:
 
                 # try direct parse
                 try:
-                    mapping = json.loads(content)
+                    data = json.loads(content)
                 except Exception:
                     json_sub = _find_json_substring(content)
                     if not json_sub:
                         raise
-                    mapping = json.loads(json_sub)
+                    data = json.loads(json_sub)
+
+                # Normalize output structure
+                if "mapping" not in data:
+                    mapping_candidate = {k: v for k, v in data.items() if k != "instrument_rules"}
+                    data = {"mapping": mapping_candidate, "instrument_rules": data.get("instrument_rules", [])}
 
                 # sanitize mapping
-                sanitized: Dict[str, str] = {}
-                for tgt, cand in mapping.items():
+                sanitized_mapping: Dict[str, str] = {}
+                for tgt, cand in data["mapping"].items():
                     if not isinstance(cand, str):
                         continue
                     cand = cand.strip()
                     if cand in headers or re.fullmatch(r"Column_\d+", cand):
-                        sanitized[tgt] = cand
+                        sanitized_mapping[tgt] = cand
+                
+                # sanitize rules
+                sanitized_rules = []
+                if "instrument_rules" in data and isinstance(data["instrument_rules"], list):
+                     for r in data["instrument_rules"]:
+                         if "keyword" in r and "type" in r:
+                             sanitized_rules.append(r)
 
-                if sanitized:
-                    logger.info("LLM mapping accepted: %s", sanitized)
-                    return sanitized
+                if sanitized_mapping:
+                    logger.info("LLM mapping accepted: %s, Rules: %s", sanitized_mapping, sanitized_rules)
+                    return {"mapping": sanitized_mapping, "rules": sanitized_rules}
+                
                 raise ValueError("LLM mapping returned no valid header names")
 
             except Exception as exc:
@@ -268,7 +360,7 @@ class CSVParser:
                 attempt += 1
 
         logger.exception("LLM mapping exhausted retries; falling back to heuristics. Last error: %s", last_exc)
-        return self._heuristic_mapping(headers, sample_row)
+        return {"mapping": self._heuristic_mapping(headers, sample_row), "rules": []}
 
     # ---------------
     # Heuristic (deterministic, conservative)
@@ -336,7 +428,7 @@ class CSVParser:
     # ---------------
     # Process & normalize (returns list[dict])
     # ---------------
-    def process_and_normalize(self, file_content: bytes, mapping: Dict[str, str]) -> List[Dict[str, Any]]:
+    def process_and_normalize(self, file_content: bytes, mapping: Dict[str, str], rules: List[Dict] = None) -> List[Dict[str, Any]]:
         """
         Read CSV bytes and return normalized trade dicts.
         Numeric fields -> Decimal or None; dates -> ISO string or None.
@@ -397,7 +489,6 @@ class CSVParser:
                     metadata[col] = str(val).strip()
 
             # Direction normalization
-            # ✅ FIX: Normalized to UPPERCASE "LONG" / "SHORT"
             if "direction" in trade:
                 d = str(trade["direction"]).strip().upper()
                 if d in DIRECTION_POSITIVE:
@@ -407,19 +498,23 @@ class CSVParser:
                 else:
                     trade["direction"] = trade["direction"].upper()
 
-            # Instrument type normalization: preserve raw in metadata and set canonical or None
+            # Instrument type normalization
+            normalized_it = None
             if "instrument_type" in trade:
                 raw_it = trade.get("instrument_type")
                 normalized_it = normalize_instrument_type(raw_it)
-                # keep original raw for traceability
                 if metadata is None:
                     metadata = {}
                 metadata["instrument_type_raw"] = raw_it
-                if normalized_it:
-                    trade["instrument_type"] = normalized_it
-                else:
-                    # set None to avoid backend Pydantic pattern mismatch; original kept in metadata
-                    trade["instrument_type"] = None
+
+            # If no valid instrument type found, try to infer from SYMBOL
+            if not normalized_it and "symbol" in trade:
+                normalized_it = infer_instrument_from_symbol(trade["symbol"], rules=rules)
+            
+            if normalized_it:
+                trade["instrument_type"] = normalized_it
+            else:
+                trade["instrument_type"] = None
 
             # Numeric conversions -> Decimal
             for field in numeric_fields:

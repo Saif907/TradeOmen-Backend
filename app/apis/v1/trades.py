@@ -1,61 +1,104 @@
 # backend/app/apis/v1/trades.py
+
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field, validator
+import json
+import io
+from uuid import uuid4
 from datetime import datetime
+from typing import List, Optional, Dict, Any
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+    Query,
+    UploadFile,
+    File
+)
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field, field_validator, model_validator
 from supabase import create_client, Client
 
 from app.core.config import settings
 from app.auth.dependency import get_current_user
-# ✅ Import the new service
-from app.services.analytics import AnalyticsService
+from app.lib.llm_client import llm_client
+from app.lib.data_sanitizer import sanitizer
 
-# --- Configuration & Logging ---
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
+
 router = APIRouter()
 security = HTTPBearer()
 logger = logging.getLogger(__name__)
 
-# --- Pydantic Models (Validation) ---
+SCREENSHOT_BUCKET = "trade-screenshots"
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
+ALLOWED_IMAGE_TYPES = {
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+}
+
+# ---------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------
 
 class TradeBase(BaseModel):
     symbol: str = Field(..., min_length=1, max_length=20)
     instrument_type: str = Field("STOCK", pattern="^(STOCK|CRYPTO|FOREX|FUTURES)$")
     direction: str = Field(..., pattern="^(?i)(LONG|SHORT)$")
-    status: str = Field("OPEN", pattern="^(?i)(OPEN|CLOSED|PENDING|CANCELED)$")
+    status: str = Field("OPEN", pattern="^(?i)(OPEN|CLOSED)$")
+
     entry_price: float = Field(..., gt=0)
-    exit_price: Optional[float] = Field(None, gt=0)
     quantity: float = Field(..., gt=0)
+
+    exit_price: Optional[float] = Field(None, gt=0)
     stop_loss: Optional[float] = Field(None, gt=0)
     target: Optional[float] = Field(None, gt=0)
+
     entry_time: datetime
     exit_time: Optional[datetime] = None
+
     fees: float = Field(0.0, ge=0)
+
     encrypted_notes: Optional[str] = None
     notes: Optional[str] = None
-    encrypted_screenshots: Optional[List[str]] = []
-    strategy_id: Optional[str] = None
+
     tags: Optional[List[str]] = []
+    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
+    strategy_id: Optional[str] = None
 
-    @validator('symbol')
+    # ✅ NEW
+    screenshots: Optional[List[str]] = []
+
+    @field_validator("symbol")
+    @classmethod
     def uppercase_symbol(cls, v):
-        return v.upper()
+        return v.upper().strip()
 
-    @validator('direction', pre=True)
-    def normalize_direction(cls, v):
-        return v.upper() 
+    @field_validator("direction", "status", "instrument_type", mode="before")
+    @classmethod
+    def uppercase_enums(cls, v):
+        return v.upper().strip() if v else v
 
-    @validator('status', pre=True)
-    def normalize_status(cls, v):
-        return v.upper() 
-    
-    @validator('instrument_type', pre=True)
-    def normalize_instrument(cls, v):
-        return v.upper()
 
 class TradeCreate(TradeBase):
-    pass
+    @model_validator(mode="after")
+    def validate_trade(self):
+        if self.exit_time and self.exit_time < self.entry_time:
+            raise ValueError("Exit time cannot be before entry time.")
+
+        if self.status == "CLOSED":
+            if not self.exit_price:
+                raise ValueError("Closed trades require exit price.")
+            if not self.exit_time:
+                raise ValueError("Closed trades require exit time.")
+
+        return self
+
 
 class TradeUpdate(BaseModel):
     symbol: Optional[str] = None
@@ -70,16 +113,12 @@ class TradeUpdate(BaseModel):
     entry_time: Optional[datetime] = None
     exit_time: Optional[datetime] = None
     fees: Optional[float] = None
-    notes: Optional[str] = None 
+    notes: Optional[str] = None
+    tags: Optional[List[str]] = None
+    metadata: Optional[Dict[str, Any]] = None
     strategy_id: Optional[str] = None
+    screenshots: Optional[List[str]] = None
 
-    @validator('symbol')
-    def uppercase_symbol(cls, v):
-        return v.upper() if v else None
-
-    @validator('direction', pre=True)
-    def normalize_direction(cls, v):
-        return v.upper() if v else None
 
 class TradeResponse(TradeBase):
     id: str
@@ -88,167 +127,179 @@ class TradeResponse(TradeBase):
     created_at: str
     notes: Optional[str] = Field(None, alias="encrypted_notes")
 
-# --- Dependency ---
 
-def get_authenticated_client(creds: HTTPAuthorizationCredentials = Depends(security)) -> Client:
-    token = creds.credentials
-    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
-    client.postgrest.auth(token)
+class PaginatedTradesResponse(BaseModel):
+    data: List[TradeResponse]
+    total: int
+    page: int
+    size: int
+
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
+async def extract_tags_and_mistakes(notes: str) -> Dict[str, Any]:
+    if not notes or len(notes) < 5:
+        return {"tags": [], "mistakes": []}
+
+    system_prompt = """
+    You are a Trading Psychology Coach.
+    Extract:
+    - technical tags
+    - psychological mistakes
+    Return JSON: {"tags": [], "mistakes": []}
+    """
+
+    try:
+        safe_notes = sanitizer.sanitize(notes)
+        response = await llm_client.generate_response(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": safe_notes}
+            ],
+            model="gemini-2.5-flash",
+            provider="gemini",
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response["content"])
+    except Exception as e:
+        logger.warning(f"AI extraction failed: {e}")
+        return {"tags": [], "mistakes": []}
+
+
+def get_authenticated_client(
+    creds: HTTPAuthorizationCredentials = Depends(security)
+) -> Client:
+    client = create_client(
+        settings.SUPABASE_URL,
+        settings.SUPABASE_SERVICE_ROLE_KEY
+    )
+    client.postgrest.auth(creds.credentials)
     return client
 
-# --- Endpoints ---
+# ---------------------------------------------------------------------
+# Screenshot Upload Endpoint
+# ---------------------------------------------------------------------
 
-@router.get("/dashboard")
-def get_dashboard_stats(
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
+@router.post("/uploads/trade-screenshot", status_code=201)
+async def upload_trade_screenshot(
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """
-    Returns aggregated trading statistics for the dashboard.
-    Delegates heavy calculation to the AnalyticsService.
-    """
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(400, "Only image files are allowed")
+
+    contents = await file.read()
+    if len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Image too large (max 5MB)")
+
     user_id = current_user["sub"]
-    
+    ext = file.filename.rsplit(".", 1)[-1].lower()
+    filename = f"{uuid4().hex}.{ext}"
+    path = f"{user_id}/{filename}"
+
     try:
-        # 1. Fetch raw trade data
-        # Note: We fetch 'strategies' too if we want to map names in the service later
-        response = supabase.table("trades").select("*").eq("user_id", user_id).execute()
-        trades_data = response.data
-        
-        # 2. Pass to Analytics Engine
-        analytics = AnalyticsService(trades_data)
-        
-        # 3. Return computed stats
-        return analytics.get_dashboard_stats()
+        supabase = create_client(
+            settings.SUPABASE_URL,
+            settings.SUPABASE_SERVICE_ROLE_KEY
+        )
+
+        # ✅ THIS is the important line
+        result = supabase.storage.from_("trade-screenshots").upload(
+            path,
+            contents,
+            {"content-type": file.content_type}
+        )
+
+        if result is None:
+            raise Exception("Supabase upload returned None")
+
+        # ✅ Robust public URL handling
+        public_url = supabase.storage.from_("trade-screenshots").get_public_url(path)
+
+        url = (
+            public_url
+            if isinstance(public_url, str)
+            else public_url.get("publicURL") or public_url.get("public_url")
+        )
+
+        if not url:
+            raise Exception("Failed to generate public URL")
+
+        return {"url": url}
 
     except Exception as e:
-        logger.error(f"Dashboard Stats Error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Failed to calculate dashboard statistics")
+        logger.error(f"Screenshot upload failed: {e}", exc_info=True)
+        raise HTTPException(500, "Screenshot upload failed")
 
-@router.post("/", response_model=TradeResponse, status_code=status.HTTP_201_CREATED)
-def create_trade(
-    trade: TradeCreate, 
+
+# ---------------------------------------------------------------------
+# Trade Endpoints
+# ---------------------------------------------------------------------
+
+@router.post("/", response_model=TradeResponse, status_code=201)
+async def create_trade(
+    trade: TradeCreate,
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
     user_id = current_user["sub"]
-    logger.info(f"User {user_id} creating trade for {trade.symbol}")
+
+    clean_notes = sanitizer.sanitize(trade.notes) if trade.notes else None
+    ai_tags, mistakes = [], []
+
+    if clean_notes:
+        analysis = await extract_tags_and_mistakes(clean_notes)
+        ai_tags = analysis.get("tags", [])
+        mistakes = analysis.get("mistakes", [])
+
+    tags = list(set((trade.tags or []) + ai_tags + mistakes))
 
     pnl = None
-    if trade.exit_price and trade.exit_price > 0:
-        mult = 1.0 if trade.direction == "LONG" else -1.0
-        pnl = (float(trade.exit_price) - float(trade.entry_price)) * float(trade.quantity) * mult - float(trade.fees)
+    if trade.exit_price:
+        mult = 1 if trade.direction == "LONG" else -1
+        pnl = (
+            (trade.exit_price - trade.entry_price)
+            * trade.quantity
+            * mult
+            - trade.fees
+        )
 
     trade_data = trade.dict(exclude={"notes"})
-    if trade.notes: trade_data["encrypted_notes"] = trade.notes
-    
-    trade_data["pnl"] = pnl
-    trade_data["user_id"] = user_id
-    trade_data["entry_time"] = trade.entry_time.isoformat()
-    if trade.exit_time:
-        trade_data["exit_time"] = trade.exit_time.isoformat()
+    trade_data.update({
+        "user_id": user_id,
+        "tags": tags,
+        "pnl": pnl,
+        "entry_time": trade.entry_time.isoformat(),
+        "exit_time": trade.exit_time.isoformat() if trade.exit_time else None,
+        "encrypted_notes": clean_notes,
+    })
 
-    try:
-        response = supabase.table("trades").insert(trade_data).execute()
-        if not response.data:
-            raise HTTPException(status_code=500, detail="Failed to create trade record")
-        return response.data[0]
-    except Exception as e:
-        logger.error(f"DB Error creation: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Database Error: {str(e)}")
+    response = supabase.table("trades").insert(trade_data).execute()
+    if not response.data:
+        raise HTTPException(500, "Trade insert failed")
 
-@router.put("/{trade_id}", response_model=TradeResponse)
-def update_trade(
-    trade_id: str,
-    updates: TradeUpdate,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
-):
-    user_id = current_user["sub"]
-    
-    try:
-        existing_res = supabase.table("trades").select("*").eq("id", trade_id).eq("user_id", user_id).execute()
-        if not existing_res.data:
-            raise HTTPException(status_code=404, detail="Trade not found or access denied")
-        
-        existing_trade = existing_res.data[0]
-        
-        update_data = {k: v for k, v in updates.dict(exclude={"notes"}).items() if v is not None}
-        if updates.notes is not None:
-             update_data["encrypted_notes"] = updates.notes
+    return response.data[0]
 
-        if "entry_time" in update_data:
-             update_data["entry_time"] = update_data["entry_time"].isoformat()
-        if "exit_time" in update_data:
-             update_data["exit_time"] = update_data["exit_time"].isoformat()
-
-        merged = {**existing_trade, **update_data}
-        
-        should_recalc = any(k in update_data for k in ["entry_price", "exit_price", "quantity", "direction", "fees"])
-        
-        if should_recalc:
-            exit_p = float(merged.get("exit_price") or 0)
-            if exit_p > 0:
-                entry_p = float(merged.get("entry_price") or 0)
-                qty = float(merged.get("quantity") or 0)
-                fees = float(merged.get("fees") or 0)
-                direction = merged.get("direction", "LONG").upper()
-                
-                mult = 1.0 if direction == "LONG" else -1.0
-                new_pnl = (exit_p - entry_p) * qty * mult - fees
-                
-                update_data["pnl"] = new_pnl
-                
-                if "status" not in update_data:
-                     update_data["status"] = "CLOSED"
-            else:
-                update_data["pnl"] = None
-                if "status" not in update_data:
-                     update_data["status"] = "OPEN"
-
-        response = supabase.table("trades").update(update_data).eq("id", trade_id).execute()
-        
-        if not response.data:
-             raise HTTPException(status_code=500, detail="Update failed")
-             
-        logger.info(f"Trade {trade_id} updated by {user_id}")
-        return response.data[0]
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error updating trade {trade_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Update failed: {str(e)}")
-
-@router.get("/", response_model=List[TradeResponse])
+@router.get("/", response_model=PaginatedTradesResponse)
 def get_trades(
-    skip: int = 0, 
-    limit: int = 50, 
-    symbol: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    try:
-        query = supabase.table("trades").select("*")
-        if symbol:
-            query = query.eq("symbol", symbol.upper())
-        response = query.order("entry_time", desc=True).range(skip, skip + limit - 1).execute()
-        return response.data
-    except Exception as e:
-        logger.error(f"Error fetching trades: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch trades")
+    offset = (page - 1) * limit
+    res = (
+        supabase.table("trades")
+        .select("*", count="exact")
+        .order("entry_time", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
 
-@router.delete("/{trade_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_trade(
-    trade_id: str, 
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
-):
-    try:
-        response = supabase.table("trades").delete().eq("id", trade_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Trade not found")
-        return None
-    except Exception as e:
-        logger.error(f"Error deleting trade: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete trade")
+    return {
+        "data": res.data,
+        "total": res.count or 0,
+        "page": page,
+        "size": limit,
+    }
