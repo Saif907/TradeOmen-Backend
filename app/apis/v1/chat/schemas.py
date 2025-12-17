@@ -6,7 +6,7 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     model: str = "gemini-2.5-flash"
-    provider: Optional[str] = None  # Optional override
+    provider: Optional[str] = 'gemini'  # Optional override
 
 class ChatUsage(BaseModel):
     total_tokens: Optional[int] = 0

@@ -45,6 +45,8 @@ class Settings(BaseSettings):
     SUPABASE_URL: str
     SUPABASE_SERVICE_ROLE_KEY: str
 
+    # Storage
+    SCREENSHOT_BUCKET: str = "trade-screenshots"
     # --- Security ---
     SECRET_KEY: str
     ALGORITHM: str = "HS256"
