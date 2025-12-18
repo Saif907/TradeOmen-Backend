@@ -14,7 +14,7 @@ class Settings(BaseSettings):
     )
 
     # --- App Info ---
-    APP_NAME: str = "TradeLM AI Backend"
+    APP_NAME: str = "TradeOmen AI Backend"
     APP_VERSION: str = "0.1.0"
     ENVIRONMENT: str = "development"
 
@@ -33,6 +33,7 @@ class Settings(BaseSettings):
         "http://127.0.0.1:8080",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://www.tradeomen.com",
     ]
 
     # --- Database ---

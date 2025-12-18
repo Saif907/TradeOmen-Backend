@@ -103,7 +103,7 @@ async def health_check():
 @app.get("/", tags=["System"])
 async def root():
     return {
-        "message": "Welcome to TradeLM AI API", 
+        "message": "Welcome to TradeOmen AI API", 
         "docs": "/docs" if settings.ENVIRONMENT != "production" else "Hidden"
     }
 
