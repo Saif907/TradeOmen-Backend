@@ -3,6 +3,7 @@
 Chat router - production-ready adjustments.
 
 Key points:
+- Integrated QuotaManager for usage limits (chats, imports, web search).
 - chat_messages.encrypted_content is treated as PLAINTEXT here (historical column name).
 - Sensitive trade fields (trades.encrypted_notes, screenshots) remain encrypted elsewhere.
 - LLM context uses the last 10 messages.
@@ -19,15 +20,20 @@ from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
 from supabase import Client
 
+# --- Core Dependencies ---
+from app.core.database import db
 from app.auth.dependency import get_current_user
 from app.lib.llm_client import llm_client
 from app.lib.csv_parser import csv_parser
 from app.apis.v1.trades import TradeCreate
 
+# --- Schemas & Services ---
 from .schemas import ChatRequest, ChatResponse, SessionSchema, MessageSchema
 from .dependencies import get_authenticated_client
 from .services import generate_session_title, parse_trade_intent
 from app.services.chat_pipeline import process_chat_message
+from app.services.quota_manager import QuotaManager
+from app.auth.permissions import check_ai_quota
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -52,6 +58,32 @@ PERPLEXITY_MODEL_DEFAULT = "sonar"
 # -------------------------------------------------------------------
 # HELPERS
 # -------------------------------------------------------------------
+async def get_full_user_profile(user_id: str) -> Dict[str, Any]:
+    """
+    Helper to fetch profile specifically for quota checks.
+    Includes last_chat_reset_at needed for daily resets.
+    """
+    if not db.pool:
+        # Fallback if DB isn't ready, defaults to FREE limits implicitly
+        return {"plan_tier": "FREE"}
+    
+    query = """
+        SELECT id, plan_tier, daily_chat_count, last_chat_reset_at, 
+               monthly_import_count, monthly_ai_tokens_used 
+        FROM public.user_profiles 
+        WHERE id = $1
+    """
+    row = await db.fetch_one(query, user_id)
+    return dict(row) if row else {"plan_tier": "FREE"}
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough estimation (1 token ~= 4 chars) for usage tracking."""
+    if not text:
+        return 0
+    return len(text) // 4
+
+
 def serialize_for_db(data: Dict[str, Any]) -> Dict[str, Any]:
     """Prepare dictionary for insertion into Postgres via Supabase client."""
     clean: Dict[str, Any] = {}
@@ -261,6 +293,22 @@ async def confirm_import(
         user_id = current_user["sub"]
         session_id = payload.get("session_id")
 
+        # -----------------------------------------------------------
+        # 1. QUOTA CHECK: Import Limits & Trade Storage
+        # -----------------------------------------------------------
+        profile = await get_full_user_profile(user_id)
+        
+        # Check monthly import count
+        QuotaManager.check_usage_limit(
+            profile, 
+            limit_key="monthly_csv_imports", 
+            current_usage_key="monthly_import_count"
+        )
+
+        # Check total trade storage limit
+        await QuotaManager.check_trade_storage_limit(user_id, profile)
+        # -----------------------------------------------------------
+
         # Download file bytes from storage
         res = supabase.storage.from_("temp-imports").download(payload["file_path"])
         raw_trades = csv_parser.process_and_normalize(res, payload["mapping"])
@@ -303,6 +351,12 @@ async def confirm_import(
         # remove temp file
         supabase.storage.from_("temp-imports").remove([payload["file_path"]])
 
+        # -----------------------------------------------------------
+        # 2. QUOTA INCREMENT: Count the import success
+        # -----------------------------------------------------------
+        await QuotaManager.increment_usage(user_id, "csv_import")
+        # -----------------------------------------------------------
+
         msg = f"Successfully imported {len(valid_trades)} trades."
         if failed_rows:
             msg += f" {len(failed_rows)} rows failed validation."
@@ -336,6 +390,8 @@ async def confirm_import(
             "message": msg,
             "session_id": session_id
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Import execution failed: %s", e)
         raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
@@ -348,12 +404,20 @@ async def confirm_import(
 async def chat_with_ai(
     request: ChatRequest,
     background_tasks: BackgroundTasks,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    # 👇 This dependency now automatically:
+    # 1. Fetches the live user profile
+    # 2. Checks the daily message limit (402 error if exceeded)
+    # 3. Sets the '_needs_daily_reset' flag if it's a new day
+    user_profile: Dict[str, Any] = Depends(check_ai_quota),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    user_id = current_user["sub"]
+    # Extract user_id directly from the profile returned by permissions.py
+    user_id = str(user_profile["id"])
     session_id = request.session_id
     raw_message = (request.message or "").strip()
+
+    # Capture the reset flag (set inside check_ai_quota -> QuotaManager)
+    needs_reset = user_profile.get("_needs_daily_reset", False)
 
     # Support explicit flag and legacy prefix
     web_search_flag = bool(getattr(request, "web_search", False))
@@ -361,6 +425,13 @@ async def chat_with_ai(
         web_search_flag = True
         raw_message = raw_message.replace("[WEB SEARCH]", "").strip()
         logger.info("Web search (legacy prefix) activated for user %s", user_id)
+
+    # -----------------------------------------------------------
+    # FEATURE CHECK: Web Search
+    # -----------------------------------------------------------
+    if web_search_flag:
+        # We already have the profile, just check the feature flag
+        QuotaManager.check_feature_access(user_profile, "allow_web_search")
 
     if not raw_message:
         raise HTTPException(status_code=400, detail="Empty message")
@@ -476,6 +547,25 @@ async def chat_with_ai(
         except Exception as e:
             logger.warning("Failed to persist assistant reply: %s", e)
 
+        # -----------------------------------------------------------
+        # 3. QUOTA INCREMENT (BACKGROUND TASK)
+        # -----------------------------------------------------------
+        # Estimate usage (user input + assistant output)
+        total_tokens = estimate_tokens(raw_message) + estimate_tokens(response_text)
+        
+        # We fire this off in the background so the user gets the response faster.
+        # This handles the DB update asynchronously.
+        background_tasks.add_task(
+            QuotaManager.increment_usage,
+            user_id, 
+            "chat_message", 
+            extra_data={
+                "needs_reset": needs_reset,
+                "tokens": total_tokens
+            }
+        )
+        # -----------------------------------------------------------
+
         # --- Possibly update rolling summary asynchronously (DISABLED by default) ---
         try:
             if SUMMARY_ENABLED:
@@ -490,10 +580,12 @@ async def chat_with_ai(
         # --- Return the response (structured if possible) ---
         try:
             parsed = json.loads(response_text)
-            return {"response": json.dumps(parsed, ensure_ascii=False), "session_id": session_id, "usage": {"total_tokens": 0}}
+            return {"response": json.dumps(parsed, ensure_ascii=False), "session_id": session_id, "usage": {"total_tokens": total_tokens}}
         except Exception:
-            return {"response": response_text, "session_id": session_id, "usage": {"total_tokens": 0}}
+            return {"response": response_text, "session_id": session_id, "usage": {"total_tokens": total_tokens}}
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Chat processing failed: %s", e)
         if is_new_session and session_id:

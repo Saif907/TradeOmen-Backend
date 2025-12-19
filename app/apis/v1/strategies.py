@@ -10,6 +10,8 @@ from supabase import create_client, Client
 
 from app.core.config import settings
 from app.auth.dependency import get_current_user
+# 👇 Import QuotaManager
+from app.services.quota_manager import QuotaManager
 
 # --- Configuration & Logging ---
 router = APIRouter()
@@ -45,7 +47,6 @@ class StrategyResponse(StrategyBase):
     id: str
     user_id: str
     created_at: datetime
-    # ✅ FIX: Made Optional to prevent crashes on legacy data
     updated_at: Optional[datetime] = None 
 
 # --- Dependency ---
@@ -65,6 +66,32 @@ def create_strategy(
     supabase: Client = Depends(get_authenticated_client)
 ):
     user_id = current_user["sub"]
+    plan_tier = current_user.get("plan_tier", "FREE")
+
+    # -----------------------------------------------------------
+    # 1. QUOTA CHECK: Max Strategies
+    # -----------------------------------------------------------
+    if plan_tier != "FOUNDER":
+        # Fetch limits
+        limits = QuotaManager.get_limits(plan_tier)
+        max_strategies = limits.get("max_strategies", 1)
+
+        # Count existing strategies
+        # We use count="exact" and head=True to avoid fetching actual data (faster)
+        res = supabase.table("strategies") \
+            .select("id", count="exact", head=True) \
+            .eq("user_id", user_id) \
+            .execute()
+        
+        current_count = getattr(res, "count", 0) or 0
+
+        if current_count >= max_strategies:
+            raise HTTPException(
+                status_code=status.HTTP_402_PAYMENT_REQUIRED,
+                detail=f"Strategy limit reached ({current_count}/{max_strategies}). Upgrade to add more."
+            )
+    # -----------------------------------------------------------
+
     data = strategy.dict()
     data["user_id"] = user_id
     
@@ -83,7 +110,6 @@ def get_strategies(
     supabase: Client = Depends(get_authenticated_client)
 ):
     try:
-        # ✅ FIX: Fetch strategies without crashing if updated_at is null
         response = supabase.table("strategies").select("*").order("name", desc=False).execute()
         return response.data
     except Exception as e:
@@ -144,4 +170,4 @@ def delete_strategy(
         return None
     except Exception as e:
         logger.error(f"Error deleting strategy {strategy_id}: {e}")
-        raise HTTPException(status_code=500, detail="Deletion failed") 
+        raise HTTPException(status_code=500, detail="Deletion failed")

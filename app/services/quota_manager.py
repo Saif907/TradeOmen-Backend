@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 class PlanLimits:
     FREE = {
-        "daily_chat_msgs": 10,
+        "daily_chat_msgs": 0,
         "monthly_csv_imports": 1,
         "allow_web_search": False,
         "allow_broker_sync": False,

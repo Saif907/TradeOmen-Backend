@@ -18,6 +18,7 @@ from app.lib.encryption import crypto
 from app.lib.brokers.factory import get_broker_adapter
 from app.lib.brokers.dhan import DhanAdapter
 from urllib.parse import quote
+from app.services.quota_manager import QuotaManager
 
 router = APIRouter()
 security = HTTPBearer()
@@ -297,6 +298,7 @@ async def sync_broker(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client),
 ):
+    QuotaManager.check_feature_access(current_user, "allow_broker_sync")
     user_id = current_user["sub"]
 
     # 1. Fetch Broker Record

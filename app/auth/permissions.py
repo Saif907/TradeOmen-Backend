@@ -1,33 +1,62 @@
-# app/auth/permissions.py
-from fastapi import HTTPException, Depends
-from app.auth.dependency import get_current_user
+from typing import Dict, Any
+from fastapi import Depends, HTTPException, status
 
-def check_ai_quota(current_user: dict = Depends(get_current_user)):
+from app.auth.dependency import get_current_user
+from app.core.database import db
+from app.services.quota_manager import QuotaManager
+
+async def check_ai_quota(
+    current_user: Dict[str, Any] = Depends(get_current_user)
+) -> Dict[str, Any]:
     """
-    Blocks request if user exceeds daily AI limit.
+    1. Fetches the latest user profile (live counters).
+    2. Enforces daily chat limits via QuotaManager.
+    3. Returns the full profile so the Router doesn't need to fetch it again.
     """
-    plan = current_user.get("plan_tier", "FREE")
-    usage = current_user.get("ai_chat_quota_used", 0) # This should be a daily/monthly counter
+    user_id = current_user["sub"]
     
-    limits = {
-        "FREE": 5,
-        "PRO": 100
-    }
+    # Fetch live data from DB because JWT 'plan' might be outdated 
+    # and we definitely need the up-to-the-second 'daily_chat_count'
+    if db.pool:
+        query = """
+            SELECT id, plan_tier, daily_chat_count, last_chat_reset_at 
+            FROM public.user_profiles 
+            WHERE id = $1
+        """
+        row = await db.fetch_one(query, user_id)
+        # Convert record to dict, or fallback to JWT if DB fails (rare)
+        user_profile = dict(row) if row else current_user
+    else:
+        user_profile = current_user
+
+    # Delegate the logic to the Manager
+    # This raises HTTPException(402) if limit is exceeded
+    QuotaManager.check_usage_limit(
+        user_profile,
+        limit_key="daily_chat_msgs",
+        current_usage_key="daily_chat_count",
+        reset_key="last_chat_reset_at"
+    )
     
-    if usage >= limits.get(plan, 5):
-        raise HTTPException(
-            status_code=402, # Payment Required
-            detail="Daily AI quota exceeded. Please upgrade to Pro."
-        )
+    return user_profile
+
+
+def check_broker_sync_access(
+    current_user: Dict[str, Any] = Depends(get_current_user)
+) -> bool:
+    """
+    Blocks request if user plan does not allow broker syncing.
+    Uses QuotaManager to check the boolean flag.
+    """
+    QuotaManager.check_feature_access(current_user, "allow_broker_sync")
     return True
 
-def check_broker_sync_access(current_user: dict = Depends(get_current_user)):
+
+def check_web_search_access(
+    current_user: Dict[str, Any] = Depends(get_current_user)
+) -> bool:
     """
-    Blocks request if user tries to sync but is on Free plan.
+    Blocks request if user plan does not allow web search.
     """
-    if current_user.get("plan_tier") == "FREE":
-        raise HTTPException(
-            status_code=403, 
-            detail="Broker Auto-Sync is a Pro feature."
-        )
+    QuotaManager.check_feature_access(current_user, "allow_web_search")
     return True

@@ -4,6 +4,7 @@ import logging
 import json
 import io
 import csv
+import time
 from uuid import uuid4
 from datetime import datetime
 from typing import List, Optional, Dict, Any
@@ -28,6 +29,7 @@ from app.auth.dependency import get_current_user
 from app.lib.llm_client import llm_client
 from app.lib.data_sanitizer import sanitizer
 from app.lib.encryption import crypto
+from app.services.quota_manager import QuotaManager
 
 
 # ---------------------------------------------------------------------
@@ -46,6 +48,49 @@ ALLOWED_IMAGE_TYPES = {
     "image/jpg",
     "image/webp",
 }
+
+# ---------------------------------------------------------------------
+# Latency & Plan Caching Service (Local Helper)
+# ---------------------------------------------------------------------
+
+# Cache Store: { "user_uuid": { "plan": "PRO", "expires_at": 1700000000 } }
+_PLAN_CACHE: Dict[str, Dict[str, Any]] = {}
+CACHE_TTL = 60  # Cache plan for 60 seconds to solve US-India latency
+
+class PlanService:
+    @staticmethod
+    def get_user_plan(user_id: str, supabase: Client) -> str:
+        """
+        Fetches the user's plan. 
+        1. Checks in-memory cache (Instant).
+        2. If missing/expired, fetches from DB (Slow ~250ms).
+        3. Updates cache.
+        """
+        now = time.time()
+        
+        # 1. Check Cache
+        cached_data = _PLAN_CACHE.get(user_id)
+        if cached_data and cached_data["expires_at"] > now:
+            return cached_data["plan"]
+
+        # 2. Cache Miss - Fetch from DB
+        try:
+            res = supabase.table("user_profiles").select("plan_tier").eq("id", user_id).single().execute()
+            
+            real_plan = "FREE"
+            if res.data and res.data.get("plan_tier"):
+                real_plan = res.data.get("plan_tier").upper()
+            
+            # 3. Save to Cache
+            _PLAN_CACHE[user_id] = {
+                "plan": real_plan,
+                "expires_at": now + CACHE_TTL
+            }
+            return real_plan
+
+        except Exception as e:
+            logger.error(f"Failed to fetch plan for {user_id}: {e}")
+            return "FREE"
 
 # ---------------------------------------------------------------------
 # Models
@@ -186,20 +231,32 @@ def get_authenticated_client(
     return client
 
 
+# ---------------------------------------------------------------------
+# 1. Export Route (With Cache & Live Plan Check)
+# ---------------------------------------------------------------------
 @router.get("/export", response_class=StreamingResponse)
 def export_trades_csv(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
     """
-    Exports all trades for the authenticated user as a CSV file.
+    Exports all trades. Checks Live DB Plan via Cache.
     """
     user_id = current_user["sub"]
+
+    # 1. Get Plan (Cached)
+    user_plan = PlanService.get_user_plan(user_id, supabase)
+
+    # 2. Inject into profile for QuotaManager
+    live_profile = {**current_user, "plan_tier": user_plan}
     
-    # ✅ UPDATED: Fetch ALL trades AND join strategies
+    # 3. Check Permissions
+    QuotaManager.check_feature_access(live_profile, "allow_csv_export")
+
+    # Fetch Data
     res = (
         supabase.table("trades")
-        .select("*, strategies(name)") # Fetch strategy name
+        .select("*, strategies(name)")
         .eq("user_id", user_id)
         .order("entry_time", desc=True)
         .limit(10000) 
@@ -207,12 +264,9 @@ def export_trades_csv(
     )
     
     trades = res.data or []
-
-    # Create CSV in memory
     output = io.StringIO()
     writer = csv.writer(output)
 
-    # ✅ UPDATED: Header name
     headers = [
         "Date", "Time", "Symbol", "Type", "Side", "Status", 
         "Quantity", "Entry Price", "Exit Price", "PnL", 
@@ -220,7 +274,6 @@ def export_trades_csv(
     ]
     writer.writerow(headers)
 
-    # Write Data
     for t in trades:
         entry_iso = t.get("entry_time")
         entry_date = ""
@@ -233,7 +286,6 @@ def export_trades_csv(
             except ValueError:
                 entry_date = entry_iso
 
-        # Decrypt notes
         raw_notes = t.get("encrypted_notes") or ""
         decrypted_notes = raw_notes
         if raw_notes:
@@ -242,9 +294,7 @@ def export_trades_csv(
             except Exception:
                 pass
 
-        # ✅ UPDATED: Extract Strategy Name
         strategy_data = t.get("strategies")
-        # Handle case where strategies is None or empty dict
         strategy_name = strategy_data.get("name") if strategy_data else "No Strategy"
 
         writer.writerow([
@@ -267,7 +317,6 @@ def export_trades_csv(
         ])
 
     output.seek(0)
-
     filename = f"my_trades_export_{datetime.now().strftime('%Y%m%d')}.csv"
     
     return StreamingResponse(
@@ -277,7 +326,7 @@ def export_trades_csv(
     )
 
 # ---------------------------------------------------------------------
-# Screenshot Upload Endpoint
+# 2. Screenshot Upload (Pro Restricted + Cached Check)
 # ---------------------------------------------------------------------
 
 @router.post("/uploads/trade-screenshot", status_code=201)
@@ -288,7 +337,27 @@ async def upload_trade_screenshot(
 ):
     """
     Upload a screenshot to the SCREENSHOT_BUCKET.
+    RESTRICTED: Only available to PRO and FOUNDER plans.
     """
+    user_id = current_user["sub"]
+
+    # 1. Initialize Client
+    supabase = create_client(
+        settings.SUPABASE_URL,
+        settings.SUPABASE_SERVICE_ROLE_KEY
+    )
+
+    # 2. FAST CHECK (Uses Cache, solves Latency)
+    user_plan = PlanService.get_user_plan(user_id, supabase)
+
+    # 3. Reject Free Users Immediately
+    if user_plan not in ["PRO", "FOUNDER"]:
+        raise HTTPException(
+            status_code=403, 
+            detail="Screenshot uploads are a Pro feature. Please upgrade."
+        )
+
+    # --- Start Upload ---
     if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Only image files are allowed")
 
@@ -297,18 +366,11 @@ async def upload_trade_screenshot(
         raise HTTPException(status_code=400, detail="Image too large (max 5MB)")
 
     trade_id = request.query_params.get("trade_id")
-
-    user_id = current_user["sub"]
     ext = (file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "png")
     filename = f"{uuid4().hex}.{ext}"
     path = f"{user_id}/{filename}"
 
     try:
-        supabase = create_client(
-            settings.SUPABASE_URL,
-            settings.SUPABASE_SERVICE_ROLE_KEY
-        )
-
         res = supabase.storage.from_(SCREENSHOT_BUCKET).upload(
             path,
             contents,
@@ -319,7 +381,6 @@ async def upload_trade_screenshot(
             logger.error("Supabase upload error: %s", res)
             raise Exception("Supabase storage upload failed")
 
-        # Generate a signed URL for immediate return
         signed_url = None
         try:
             signed_resp = supabase.storage.from_(SCREENSHOT_BUCKET).create_signed_url(path, 3600)
@@ -350,7 +411,6 @@ async def upload_trade_screenshot(
                     except json.JSONDecodeError:
                         current_list = [str(current_val)]
 
-                # Encrypt the simple path only
                 encrypted_path = crypto.encrypt(path)
                 current_list.append(encrypted_path)
                 
@@ -368,9 +428,8 @@ async def upload_trade_screenshot(
 
 
 # ---------------------------------------------------------------------
-# Trade Endpoints
+# 3. Create Trade (With Limits & Cache)
 # ---------------------------------------------------------------------
-
 @router.post("/", response_model=TradeResponse, status_code=201)
 async def create_trade(
     trade: TradeCreate,
@@ -378,6 +437,15 @@ async def create_trade(
     supabase: Client = Depends(get_authenticated_client)
 ):
     user_id = current_user["sub"]
+
+    # 1. Get Plan (Cached)
+    user_plan = PlanService.get_user_plan(user_id, supabase)
+
+    # 2. Inject into profile for QuotaManager
+    live_profile = {**current_user, "plan_tier": user_plan}
+    
+    # 3. Check Limits
+    await QuotaManager.check_trade_storage_limit(user_id, live_profile)
 
     clean_notes = sanitizer.sanitize(trade.notes) if trade.notes else None
     ai_tags, mistakes = [], []
@@ -399,7 +467,6 @@ async def create_trade(
             - trade.fees
         )
 
-    # Handle Screenshot Encryption
     encrypted_screenshots_json = None
     if trade.screenshots:
         encrypted_list = [crypto.encrypt(s) for s in trade.screenshots if s]
@@ -480,7 +547,7 @@ def get_trade_screenshots(
     supabase: Client = Depends(get_authenticated_client),
 ):
     """
-    Decrypts paths and handles 'dirty' JSON metadata from legacy uploads.
+    Decrypts paths and handles 'dirty' JSON metadata.
     """
     user_id = current_user["sub"]
 
@@ -518,15 +585,12 @@ def get_trade_screenshots(
             # 1. Decrypt
             path = crypto.decrypt(enc_item)
             if path == "[Decryption Error]":
-                path = enc_item # Fallback to original if encryption was missing
+                path = enc_item 
 
-            # 2. ✅ CHECK FOR DIRTY JSON (The fix)
-            # If the decrypted path starts with "{", it might be a JSON object 
-            # containing the file metadata instead of just the path string.
+            # 2. Check for dirty JSON
             if path.strip().startswith("{"):
                 try:
                     metadata = json.loads(path)
-                    # Extract 'path' from Supabase's response format: {"bucket":..., "files": [{"path":...}]}
                     if "files" in metadata and isinstance(metadata["files"], list) and len(metadata["files"]) > 0:
                         potential_path = metadata["files"][0].get("path")
                         if potential_path:
@@ -534,9 +598,9 @@ def get_trade_screenshots(
                     elif "path" in metadata:
                         path = metadata["path"]
                 except json.JSONDecodeError:
-                    pass # Not valid JSON, ignore and use string as is
+                    pass
 
-            # 3. Clean prefixes if present
+            # 3. Clean prefixes
             if path.startswith("path:"):
                 path = path.replace("path:", "")
             
