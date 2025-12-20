@@ -4,10 +4,10 @@ import logging
 import json
 import io
 import csv
-import time
 from uuid import uuid4
-from datetime import datetime
-from typing import List, Optional, Dict, Any
+from datetime import datetime, timezone
+from enum import Enum
+from typing import List, Optional, Dict, Any, Union
 
 from fastapi import (
     APIRouter,
@@ -21,252 +21,157 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, field_validator, model_validator
 from supabase import create_client, Client
 
+# --- Internal Imports ---
 from app.core.config import settings
 from app.auth.dependency import get_current_user
-from app.lib.llm_client import llm_client
 from app.lib.data_sanitizer import sanitizer
 from app.lib.encryption import crypto
 from app.services.quota_manager import QuotaManager
+from app.services.plan_service import PlanService
 
+# ✅ IMPORT CENTRALIZED SCHEMAS
+from app.schemas import (
+    TradeCreate,
+    TradeUpdate,
+    TradeResponse,
+    PaginatedTradesResponse,
+    PlanTier,
+    InstrumentType,
+    TradeSide,
+    TradeStatus
+)
 
 # ---------------------------------------------------------------------
-# Config
+# Config & Setup
 # ---------------------------------------------------------------------
 
 router = APIRouter()
 security = HTTPBearer()
 logger = logging.getLogger(__name__)
 
-SCREENSHOT_BUCKET = "trade-screenshots"
-MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
-ALLOWED_IMAGE_TYPES = {
-    "image/png",
-    "image/jpeg",
-    "image/jpg",
-    "image/webp",
-}
+# ✅ GLOBAL ADMIN CLIENT
+# We initialize this ONCE to avoid creating a new connection for every trade in a list.
+# This client is used ONLY for storage operations (Signing/Uploading) to bypass RLS.
+supabase_admin: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
 
 # ---------------------------------------------------------------------
-# Latency & Plan Caching Service (Local Helper)
+# Services (Local Helpers)
 # ---------------------------------------------------------------------
 
-# Cache Store: { "user_uuid": { "plan": "PRO", "expires_at": 1700000000 } }
-_PLAN_CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 60  # Cache plan for 60 seconds to solve US-India latency
+class ScreenshotService:
+    """Handles logic for paths, encryption, and dirty JSON."""
 
-class PlanService:
     @staticmethod
-    def get_user_plan(user_id: str, supabase: Client) -> str:
-        """
-        Fetches the user's plan. 
-        1. Checks in-memory cache (Instant).
-        2. If missing/expired, fetches from DB (Slow ~250ms).
-        3. Updates cache.
-        """
-        now = time.time()
-        
-        # 1. Check Cache
-        cached_data = _PLAN_CACHE.get(user_id)
-        if cached_data and cached_data["expires_at"] > now:
-            return cached_data["plan"]
+    def process_stored_screenshots(encrypted_val: Union[str, List, None]) -> List[Dict[str, Any]]:
+        if not encrypted_val:
+            return []
 
-        # 2. Cache Miss - Fetch from DB
+        # Normalize input to list
         try:
-            res = supabase.table("user_profiles").select("plan_tier").eq("id", user_id).single().execute()
-            
-            real_plan = "FREE"
-            if res.data and res.data.get("plan_tier"):
-                real_plan = res.data.get("plan_tier").upper()
-            
-            # 3. Save to Cache
-            _PLAN_CACHE[user_id] = {
-                "plan": real_plan,
-                "expires_at": now + CACHE_TTL
-            }
-            return real_plan
+            raw_list = json.loads(encrypted_val) if isinstance(encrypted_val, str) else encrypted_val
+            if not isinstance(raw_list, list):
+                raw_list = [str(encrypted_val)]
+        except:
+            raw_list = [str(encrypted_val)]
 
+        final_files = []
+        
+        for item in raw_list:
+            try:
+                # 1. Decrypt
+                path = crypto.decrypt(item)
+                if path == "[Decryption Error]":
+                    path = item 
+
+                # 2. Clean "Dirty" JSON or Prefixes
+                path = ScreenshotService._clean_path(path)
+
+                # 3. Generate URL using ADMIN client
+                # We use supabase_admin to guarantee we don't get 400/403 RLS errors
+                signed_url = ScreenshotService._get_signed_url(path)
+                if signed_url:
+                    final_files.append({"url": signed_url, "uploaded_at": None})
+            
+            except Exception as e:
+                logger.warning(f"Screenshot processing error: {e}")
+                
+        return final_files
+
+    @staticmethod
+    def _clean_path(path: str) -> str:
+        path = path.strip()
+        if path.startswith("path:"):
+            return path.replace("path:", "")
+
+        if path.startswith("{"):
+            try:
+                meta = json.loads(path)
+                if "files" in meta and meta["files"]:
+                    return meta["files"][0].get("path", "")
+                if "path" in meta:
+                    return meta["path"]
+            except json.JSONDecodeError:
+                pass
+        return path
+
+    @staticmethod
+    def _get_signed_url(path: str) -> Optional[str]:
+        try:
+            # ✅ FIX: Use Global Admin Client
+            # This bypasses RLS policies that cause 400 Bad Request on the 'sign' endpoint
+            res = supabase_admin.storage.from_(settings.SCREENSHOT_BUCKET).create_signed_url(path, 3600)
+            
+            if isinstance(res, dict):
+                return res.get("signedURL") or res.get("signed_url")
+            return res # Str
         except Exception as e:
-            logger.error(f"Failed to fetch plan for {user_id}: {e}")
-            return "FREE"
-
-# ---------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------
-
-class TradeBase(BaseModel):
-    symbol: str = Field(..., min_length=1, max_length=20)
-    instrument_type: str = Field("STOCK", pattern="^(STOCK|CRYPTO|FOREX|FUTURES)$")
-    direction: str = Field(..., pattern="^(?i)(LONG|SHORT)$")
-    status: str = Field("OPEN", pattern="^(?i)(OPEN|CLOSED)$")
-
-    entry_price: float = Field(..., gt=0)
-    quantity: float = Field(..., gt=0)
-
-    exit_price: Optional[float] = Field(None, gt=0)
-    stop_loss: Optional[float] = Field(None, gt=0)
-    target: Optional[float] = Field(None, gt=0)
-
-    entry_time: datetime
-    exit_time: Optional[datetime] = None
-
-    fees: float = Field(0.0, ge=0)
-
-    encrypted_notes: Optional[str] = None
-    notes: Optional[str] = None
-
-    tags: Optional[List[str]] = Field(default_factory=list)
-    metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
-    strategy_id: Optional[str] = None
-
-    encrypted_screenshots: Optional[str] = None
-
-    @field_validator("symbol")
-    @classmethod
-    def uppercase_symbol(cls, v):
-        return v.upper().strip()
-
-    @field_validator("direction", "status", "instrument_type", mode="before")
-    @classmethod
-    def uppercase_enums(cls, v):
-        return v.upper().strip() if v else v
-
-
-class TradeCreate(TradeBase):
-    screenshots: Optional[List[str]] = None
-
-    @model_validator(mode="after")
-    def validate_trade(self):
-        if self.exit_time and self.exit_time < self.entry_time:
-            raise ValueError("Exit time cannot be before entry time.")
-
-        if self.status == "CLOSED":
-            if not self.exit_price:
-                raise ValueError("Closed trades require exit price.")
-            if not self.exit_time:
-                raise ValueError("Closed trades require exit time.")
-
-        return self
-
-
-class TradeUpdate(BaseModel):
-    symbol: Optional[str] = None
-    instrument_type: Optional[str] = None
-    direction: Optional[str] = None
-    status: Optional[str] = None
-    entry_price: Optional[float] = None
-    exit_price: Optional[float] = None
-    quantity: Optional[float] = None
-    stop_loss: Optional[float] = None
-    target: Optional[float] = None
-    entry_time: Optional[datetime] = None
-    exit_time: Optional[datetime] = None
-    fees: Optional[float] = None
-    notes: Optional[str] = None
-    tags: Optional[List[str]] = None
-    metadata: Optional[Dict[str, Any]] = None
-    strategy_id: Optional[str] = None
-    encrypted_screenshots: Optional[str] = None
-
-
-class TradeResponse(TradeBase):
-    id: str
-    user_id: str
-    pnl: Optional[float]
-    created_at: str
-    notes: Optional[str] = Field(None, alias="encrypted_notes")
-    strategies: Optional[Dict[str, Any]] = None
-
-
-class PaginatedTradesResponse(BaseModel):
-    data: List[TradeResponse]
-    total: int
-    page: int
-    size: int
+            logger.error(f"Failed to sign URL for {path}: {e}")
+            return None
 
 
 # ---------------------------------------------------------------------
-# Helpers
+# Dependencies
 # ---------------------------------------------------------------------
-
-async def extract_tags_and_mistakes(notes: str) -> Dict[str, Any]:
-    if not notes or len(notes) < 5:
-        return {"tags": [], "mistakes": []}
-
-    system_prompt = """
-    You are a Trading Psychology Coach.
-    Extract:
-    - technical tags
-    - psychological mistakes
-    Return JSON: {"tags": [], "mistakes": []}
-    """
-
-    try:
-        safe_notes = sanitizer.sanitize(notes)
-        response = await llm_client.generate_response(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": safe_notes}
-            ],
-            model="gemini-2.5-flash",
-            provider="gemini",
-            response_format={"type": "json_object"}
-        )
-        return json.loads(response["content"])
-    except Exception as e:
-        logger.warning(f"AI extraction failed: {e}")
-        return {"tags": [], "mistakes": []}
-
 
 def get_authenticated_client(
     creds: HTTPAuthorizationCredentials = Depends(security)
 ) -> Client:
-    client = create_client(
-        settings.SUPABASE_URL,
-        settings.SUPABASE_SERVICE_ROLE_KEY
-    )
+    # Use ANON key for RLS compliance unless admin access is strictly needed
+    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
     client.postgrest.auth(creds.credentials)
     return client
 
 
 # ---------------------------------------------------------------------
-# 1. Export Route (With Cache & Live Plan Check)
+# 1. Export Route
 # ---------------------------------------------------------------------
+
 @router.get("/export", response_class=StreamingResponse)
 def export_trades_csv(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    """
-    Exports all trades. Checks Live DB Plan via Cache.
-    """
     user_id = current_user["sub"]
-
-    # 1. Get Plan (Cached)
     user_plan = PlanService.get_user_plan(user_id, supabase)
-
-    # 2. Inject into profile for QuotaManager
-    live_profile = {**current_user, "plan_tier": user_plan}
     
-    # 3. Check Permissions
+    live_profile = {**current_user, "plan_tier": user_plan}
     QuotaManager.check_feature_access(live_profile, "allow_csv_export")
 
-    # Fetch Data
     res = (
         supabase.table("trades")
         .select("*, strategies(name)")
         .eq("user_id", user_id)
         .order("entry_time", desc=True)
-        .limit(10000) 
+        .limit(10000)
         .execute()
     )
     
     trades = res.data or []
     output = io.StringIO()
     writer = csv.writer(output)
-
+    
     headers = [
         "Date", "Time", "Symbol", "Type", "Side", "Status", 
         "Quantity", "Entry Price", "Exit Price", "PnL", 
@@ -275,49 +180,29 @@ def export_trades_csv(
     writer.writerow(headers)
 
     for t in trades:
-        entry_iso = t.get("entry_time")
-        entry_date = ""
-        entry_time = ""
-        if entry_iso:
-            try:
-                dt = datetime.fromisoformat(entry_iso.replace("Z", "+00:00"))
-                entry_date = dt.strftime("%Y-%m-%d")
-                entry_time = dt.strftime("%H:%M:%S")
-            except ValueError:
-                entry_date = entry_iso
+        entry_iso = t.get("entry_time") or ""
+        try:
+            dt = datetime.fromisoformat(entry_iso.replace("Z", "+00:00"))
+            e_date, e_time = dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S")
+        except:
+            e_date, e_time = entry_iso, ""
 
-        raw_notes = t.get("encrypted_notes") or ""
-        decrypted_notes = raw_notes
-        if raw_notes:
-            try:
-                decrypted_notes = crypto.decrypt(raw_notes)
-            except Exception:
-                pass
-
-        strategy_data = t.get("strategies")
-        strategy_name = strategy_data.get("name") if strategy_data else "No Strategy"
+        notes = t.get("encrypted_notes")
+        if notes:
+            try: notes = crypto.decrypt(notes)
+            except: pass
 
         writer.writerow([
-            entry_date,
-            entry_time,
-            t.get("symbol"),
-            t.get("instrument_type"),
-            t.get("direction"),
-            t.get("status"),
-            t.get("quantity"),
-            t.get("entry_price"),
-            t.get("exit_price"),
-            t.get("pnl"),
-            t.get("stop_loss"),
-            t.get("target"),
-            t.get("fees"),
-            decrypted_notes,
-            ", ".join(t.get("tags") or []),
-            strategy_name 
+            e_date, e_time, t.get("symbol"), t.get("instrument_type"),
+            t.get("direction"), t.get("status"), t.get("quantity"),
+            t.get("entry_price"), t.get("exit_price"), t.get("pnl"),
+            t.get("stop_loss"), t.get("target"), t.get("fees"),
+            notes, ", ".join(t.get("tags") or []),
+            t.get("strategies", {}).get("name") if t.get("strategies") else "No Strategy"
         ])
 
     output.seek(0)
-    filename = f"my_trades_export_{datetime.now().strftime('%Y%m%d')}.csv"
+    filename = f"trades_{datetime.now().strftime('%Y%m%d')}.csv"
     
     return StreamingResponse(
         iter([output.getvalue()]),
@@ -325,111 +210,99 @@ def export_trades_csv(
         headers={"Content-Disposition": f"attachment; filename={filename}"}
     )
 
+
 # ---------------------------------------------------------------------
-# 2. Screenshot Upload (Pro Restricted + Cached Check)
+# 2. Upload Route (Supports Multiple Files)
 # ---------------------------------------------------------------------
 
-@router.post("/uploads/trade-screenshot", status_code=201)
-async def upload_trade_screenshot(
+@router.post("/uploads/trade-screenshots", status_code=201)
+async def upload_trade_screenshots(
     request: Request,
-    file: UploadFile = File(...),
-    current_user: Dict[str, Any] = Depends(get_current_user)
+    files: List[UploadFile] = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Upload a screenshot to the SCREENSHOT_BUCKET.
-    RESTRICTED: Only available to PRO and FOUNDER plans.
+    Supports uploading multiple screenshots at once.
+    Only for PRO and FOUNDER plans.
     """
     user_id = current_user["sub"]
+    
+    # Check Plan using Admin Client (Reliable)
+    user_plan = PlanService.get_user_plan(user_id, supabase_admin)
 
-    # 1. Initialize Client
-    supabase = create_client(
-        settings.SUPABASE_URL,
-        settings.SUPABASE_SERVICE_ROLE_KEY
-    )
+    if user_plan not in [PlanTier.PRO.value, PlanTier.FOUNDER.value]:
+        raise HTTPException(status_code=403, detail="Upgrade to PRO to upload screenshots.")
 
-    # 2. FAST CHECK (Uses Cache, solves Latency)
-    user_plan = PlanService.get_user_plan(user_id, supabase)
+    uploaded_results = []
+    new_encrypted_paths = []
 
-    # 3. Reject Free Users Immediately
-    if user_plan not in ["PRO", "FOUNDER"]:
-        raise HTTPException(
-            status_code=403, 
-            detail="Screenshot uploads are a Pro feature. Please upgrade."
-        )
+    # 2. Iterate Files
+    for file in files:
+        if file.content_type not in settings.ALLOWED_IMAGE_TYPES:
+            continue 
+        
+        contents = await file.read()
+        if len(contents) > settings.MAX_UPLOAD_SIZE_BYTES:
+            continue
 
-    # --- Start Upload ---
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Only image files are allowed")
+        ext = file.filename.split(".")[-1] if "." in file.filename else "png"
+        filename = f"{uuid4().hex}.{ext}"
+        path = f"{user_id}/{filename}"
 
-    contents = await file.read()
-    if len(contents) > MAX_IMAGE_SIZE:
-        raise HTTPException(status_code=400, detail="Image too large (max 5MB)")
-
-    trade_id = request.query_params.get("trade_id")
-    ext = (file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "png")
-    filename = f"{uuid4().hex}.{ext}"
-    path = f"{user_id}/{filename}"
-
-    try:
-        res = supabase.storage.from_(SCREENSHOT_BUCKET).upload(
-            path,
-            contents,
-            {"content-type": file.content_type}
-        )
-
-        if not res or (isinstance(res, dict) and res.get("error")):
-            logger.error("Supabase upload error: %s", res)
-            raise Exception("Supabase storage upload failed")
-
-        signed_url = None
         try:
-            signed_resp = supabase.storage.from_(SCREENSHOT_BUCKET).create_signed_url(path, 3600)
-            if isinstance(signed_resp, dict):
-                signed_url = signed_resp.get("signedURL") or signed_resp.get("signed_url")
-            elif isinstance(signed_resp, str):
-                signed_url = signed_resp
-        except Exception:
-            pass
-
-        uploaded_to_trade = False
-
-        if trade_id:
-            existing_resp = supabase.table("trades").select("encrypted_screenshots, user_id").eq("id", trade_id).single().execute()
-            tdata = existing_resp.data if getattr(existing_resp, "data", None) else None
-
-            if tdata and str(tdata.get("user_id")) == str(user_id):
-                current_val = tdata.get("encrypted_screenshots")
-                current_list = []
+            # ✅ Upload using Admin Client
+            res = supabase_admin.storage.from_(settings.SCREENSHOT_BUCKET).upload(
+                path, contents, {"content-type": file.content_type}
+            )
+            if res:
+                new_encrypted_paths.append(crypto.encrypt(path))
                 
-                if current_val:
-                    try:
-                        parsed = json.loads(current_val)
-                        if isinstance(parsed, list):
-                            current_list = parsed
-                        else:
-                            current_list = [str(current_val)]
-                    except json.JSONDecodeError:
-                        current_list = [str(current_val)]
+                # ✅ Sign using Admin Client
+                signed_url = ScreenshotService._get_signed_url(path)
+                uploaded_results.append({"filename": file.filename, "url": signed_url or path})
+        except Exception as e:
+            logger.error(f"Failed to upload {file.filename}: {e}")
 
-                encrypted_path = crypto.encrypt(path)
-                current_list.append(encrypted_path)
-                
-                new_val = json.dumps(current_list)
+    # 3. Associate with Trade (Batch Update)
+    trade_id = request.query_params.get("trade_id")
+    uploaded_to_trade = False
 
-                update_resp = supabase.table("trades").update({"encrypted_screenshots": new_val}).eq("id", trade_id).execute()
-                if getattr(update_resp, "data", None):
-                    uploaded_to_trade = True
+    if trade_id and new_encrypted_paths:
+        # Use Admin client to fetch trade to ensure we see it even if RLS is weird, 
+        # though we check user_id manually below for safety.
+        existing = supabase_admin.table("trades").select("encrypted_screenshots, user_id").eq("id", trade_id).single().execute()
+        
+        if existing.data and str(existing.data["user_id"]) == str(user_id):
+            current_val = existing.data.get("encrypted_screenshots")
+            current_list = []
+            
+            if current_val:
+                try: 
+                    current_list = json.loads(current_val) if isinstance(current_val, str) else current_val
+                    if not isinstance(current_list, list): current_list = [str(current_val)]
+                except: current_list = [str(current_val)]
+            
+            final_list = current_list + new_encrypted_paths
+            
+            supabase_admin.table("trades").update({
+                "encrypted_screenshots": json.dumps(final_list)
+            }).eq("id", trade_id).execute()
+            uploaded_to_trade = True
 
-        return {"url": signed_url or path, "uploaded_to_trade": uploaded_to_trade}
+    if not uploaded_results:
+        raise HTTPException(status_code=400, detail="No valid files were uploaded.")
 
-    except Exception as e:
-        logger.error(f"Screenshot upload failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Screenshot upload failed")
+    return {
+        "files": uploaded_results, 
+        "uploaded_to_trade": uploaded_to_trade,
+        "count": len(uploaded_results)
+    }
 
 
 # ---------------------------------------------------------------------
-# 3. Create Trade (With Limits & Cache)
+# 3. Trade CRUD
 # ---------------------------------------------------------------------
+
 @router.post("/", response_model=TradeResponse, status_code=201)
 async def create_trade(
     trade: TradeCreate,
@@ -437,57 +310,37 @@ async def create_trade(
     supabase: Client = Depends(get_authenticated_client)
 ):
     user_id = current_user["sub"]
-
-    # 1. Get Plan (Cached)
     user_plan = PlanService.get_user_plan(user_id, supabase)
-
-    # 2. Inject into profile for QuotaManager
-    live_profile = {**current_user, "plan_tier": user_plan}
     
-    # 3. Check Limits
+    live_profile = {**current_user, "plan_tier": user_plan}
     await QuotaManager.check_trade_storage_limit(user_id, live_profile)
 
+    tags = list(set(trade.tags or []))
     clean_notes = sanitizer.sanitize(trade.notes) if trade.notes else None
-    ai_tags, mistakes = [], []
-
-    if clean_notes:
-        analysis = await extract_tags_and_mistakes(clean_notes)
-        ai_tags = analysis.get("tags", [])
-        mistakes = analysis.get("mistakes", [])
-
-    tags = list(set((trade.tags or []) + ai_tags + mistakes))
-
-    pnl = None
-    if trade.exit_price:
-        mult = 1 if trade.direction == "LONG" else -1
-        pnl = (
-            (trade.exit_price - trade.entry_price)
-            * trade.quantity
-            * mult
-            - trade.fees
-        )
-
-    encrypted_screenshots_json = None
+    
+    enc_screenshots = None
     if trade.screenshots:
-        encrypted_list = [crypto.encrypt(s) for s in trade.screenshots if s]
-        encrypted_screenshots_json = json.dumps(encrypted_list)
+        enc_screenshots = json.dumps([crypto.encrypt(s) for s in trade.screenshots if s])
 
-    trade_data = trade.dict(exclude={"notes", "screenshots"})
+    trade_data = trade.model_dump(exclude={"notes", "screenshots"})
     trade_data.update({
         "user_id": user_id,
         "tags": tags,
-        "pnl": pnl,
+        "pnl": trade.calculate_pnl(),
         "entry_time": trade.entry_time.isoformat(),
         "exit_time": trade.exit_time.isoformat() if trade.exit_time else None,
         "encrypted_notes": clean_notes,
-        "encrypted_screenshots": encrypted_screenshots_json,
+        "encrypted_screenshots": enc_screenshots,
+        "direction": trade.direction.value,
+        "status": trade.status.value,
+        "instrument_type": trade.instrument_type.value,
     })
 
-    response = supabase.table("trades").insert(trade_data).execute()
-    if not getattr(response, "data", None):
+    res = supabase.table("trades").insert(trade_data).execute()
+    if not res.data:
         raise HTTPException(status_code=500, detail="Trade insert failed")
 
-    return response.data[0]
+    return res.data[0]
 
 
 @router.get("/", response_model=PaginatedTradesResponse)
@@ -497,17 +350,28 @@ def get_trades(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
+    user_id = current_user["sub"]
     offset = (page - 1) * limit
+
     res = (
         supabase.table("trades")
         .select("*, strategies(name)", count="exact")
+        .eq("user_id", user_id)
         .order("entry_time", desc=True)
         .range(offset, offset + limit - 1)
         .execute()
     )
 
-    data = getattr(res, "data", None) or []
-    total = int(getattr(res, "count", 0) or 0)
+    data = res.data or []
+    total = res.count or 0
+
+    # Decrypt notes
+    for t in data:
+        if t.get("encrypted_notes"):
+            try:
+                t["encrypted_notes"] = crypto.decrypt(t["encrypted_notes"])
+            except:
+                t["encrypted_notes"] = ""
 
     return {
         "data": data,
@@ -534,10 +398,19 @@ def get_trade(
         .execute()
     )
 
-    if not getattr(res, "data", None):
+    if not res.data:
         raise HTTPException(status_code=404, detail="Trade not found")
 
-    return res.data
+    trade_data = res.data
+
+    if trade_data.get("encrypted_notes"):
+        try:
+            trade_data["encrypted_notes"] = crypto.decrypt(trade_data["encrypted_notes"])
+        except Exception as e:
+            logger.warning(f"Failed to decrypt notes for trade {trade_id}: {e}")
+            trade_data["encrypted_notes"] = ""
+
+    return trade_data
 
 
 @router.get("/{trade_id}/screenshots")
@@ -546,82 +419,21 @@ def get_trade_screenshots(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client),
 ):
-    """
-    Decrypts paths and handles 'dirty' JSON metadata.
-    """
     user_id = current_user["sub"]
 
-    res = (
-        supabase.table("trades")
-        .select("encrypted_screenshots, user_id")
-        .eq("id", trade_id)
-        .single()
-        .execute()
-    )
-
-    if not getattr(res, "data", None):
+    # 1. Verify Ownership with User Client (RLS check)
+    res = supabase.table("trades").select("encrypted_screenshots, user_id").eq("id", trade_id).single().execute()
+    
+    if not res.data:
         raise HTTPException(status_code=404, detail="Trade not found")
-
-    tdata = res.data
-    if str(tdata.get("user_id")) != str(user_id):
+    if str(res.data.get("user_id")) != str(user_id):
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    screenshots_val = tdata.get("encrypted_screenshots")
-    encrypted_list = []
+    # 2. Process Screenshots using Global Admin Client (in service)
+    # We passed the ownership check above, so it's safe to use admin for signing now.
+    files = ScreenshotService.process_stored_screenshots(res.data.get("encrypted_screenshots"))
     
-    if screenshots_val:
-        try:
-            parsed = json.loads(screenshots_val)
-            if isinstance(parsed, list):
-                encrypted_list = parsed
-            else:
-                encrypted_list = [str(screenshots_val)]
-        except Exception:
-            encrypted_list = [str(screenshots_val)]
-
-    final_files = []
-    for enc_item in encrypted_list:
-        try:
-            # 1. Decrypt
-            path = crypto.decrypt(enc_item)
-            if path == "[Decryption Error]":
-                path = enc_item 
-
-            # 2. Check for dirty JSON
-            if path.strip().startswith("{"):
-                try:
-                    metadata = json.loads(path)
-                    if "files" in metadata and isinstance(metadata["files"], list) and len(metadata["files"]) > 0:
-                        potential_path = metadata["files"][0].get("path")
-                        if potential_path:
-                            path = potential_path
-                    elif "path" in metadata:
-                        path = metadata["path"]
-                except json.JSONDecodeError:
-                    pass
-
-            # 3. Clean prefixes
-            if path.startswith("path:"):
-                path = path.replace("path:", "")
-            
-            # 4. Generate Signed URL
-            signed_resp = supabase.storage.from_(SCREENSHOT_BUCKET).create_signed_url(path, 3600)
-            
-            signed_url = None
-            if isinstance(signed_resp, dict):
-                signed_url = signed_resp.get("signedURL") or signed_resp.get("signed_url")
-            elif isinstance(signed_resp, str):
-                signed_url = signed_resp
-            
-            if signed_url:
-                final_files.append({"url": signed_url, "uploaded_at": None})
-            else:
-                logger.warning(f"Could not sign URL for path: {path}")
-
-        except Exception as e:
-            logger.warning(f"Error processing screenshot item: {e}")
-
-    return {"files": final_files}
+    return {"files": files}
 
 
 @router.put("/{trade_id}", response_model=TradeResponse)
@@ -632,29 +444,28 @@ async def update_trade(
     supabase: Client = Depends(get_authenticated_client)
 ):
     user_id = current_user["sub"]
-
+    
     existing = supabase.table("trades").select("user_id").eq("id", trade_id).single().execute()
-    if not getattr(existing, "data", None):
+    if not existing.data:
         raise HTTPException(status_code=404, detail="Trade not found")
-
-    if str(existing.data.get("user_id")) != str(user_id):
+    if str(existing.data["user_id"]) != str(user_id):
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    update_data = payload.dict(exclude_unset=True)
+    update_data = payload.model_dump(exclude_unset=True)
     
     if "notes" in update_data:
         update_data["encrypted_notes"] = sanitizer.sanitize(update_data.pop("notes"))
+    
+    for field in ["entry_time", "exit_time"]:
+        if field in update_data and isinstance(update_data[field], datetime):
+            update_data[field] = update_data[field].isoformat()
+            
+    for field in ["direction", "status", "instrument_type"]:
+        if field in update_data and isinstance(update_data[field], Enum):
+            update_data[field] = update_data[field].value
 
-    if "entry_time" in update_data and isinstance(update_data["entry_time"], datetime):
-        update_data["entry_time"] = update_data["entry_time"].isoformat()
-    if "exit_time" in update_data and isinstance(update_data["exit_time"], datetime):
-        update_data["exit_time"] = update_data["exit_time"].isoformat()
-
-    resp = supabase.table("trades").update(update_data).eq("id", trade_id).execute()
-    if not getattr(resp, "data", None):
-        raise HTTPException(status_code=500, detail="Trade update failed")
-
-    return resp.data[0]
+    res = supabase.table("trades").update(update_data).eq("id", trade_id).execute()
+    return res.data[0]
 
 
 @router.delete("/{trade_id}", status_code=204)
@@ -663,15 +474,12 @@ def delete_trade(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    user_id = current_user["sub"]
-
-    existing = supabase.table("trades").select("user_id").eq("id", trade_id).single().execute()
-    if not getattr(existing, "data", None):
-        raise HTTPException(status_code=404, detail="Trade not found")
-
-    if str(existing.data.get("user_id")) != str(user_id):
-        raise HTTPException(status_code=403, detail="Forbidden")
-
-    supabase.table("trades").delete().eq("id", trade_id).execute()
+    res = supabase.table("trades").delete().eq("id", trade_id).eq("user_id", current_user["sub"]).execute()
     
+    if not res.data:
+        check = supabase.table("trades").select("user_id").eq("id", trade_id).execute()
+        if check.data:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        raise HTTPException(status_code=404, detail="Trade not found")
+        
     return {"detail": "deleted"}

@@ -1,63 +1,84 @@
 # backend/app/apis/v1/strategies.py
+
 import logging
-from typing import List, Optional, Dict, Any
-from datetime import datetime
+import time
+from typing import List, Dict, Any
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field, field_validator
 from supabase import create_client, Client
 
 from app.core.config import settings
 from app.auth.dependency import get_current_user
-# 👇 Import QuotaManager
-from app.services.quota_manager import QuotaManager
 
-# --- Configuration & Logging ---
+# ✅ IMPORT CENTRALIZED SCHEMAS
+from app.schemas import (
+    StrategyCreate, 
+    StrategyUpdate, 
+    StrategyResponse, 
+    PlanTier
+)
+
 router = APIRouter()
 security = HTTPBearer()
 logger = logging.getLogger(__name__)
 
-# --- Pydantic Models ---
+# ---------------------------------------------------------------------
+# Services (Local Helpers)
+# ---------------------------------------------------------------------
 
-class StrategyBase(BaseModel):
-    name: str = Field(..., min_length=1, max_length=100)
-    description: Optional[str] = None
-    emoji: str = Field("📈", max_length=4)
-    color_hex: str = Field("#8b5cf6", pattern="^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$")
-    style: Optional[str] = Field(None, description="Day Trading, Swing, etc.")
-    instrument_types: List[str] = []
-    rules: Dict[str, List[str]] = Field(default_factory=dict)
-    track_missed_trades: bool = True
+class PlanService:
+    """
+    Handles Latency/Caching for User Plans.
+    Identical to the service in trades.py to maintain consistency.
+    """
+    _PLAN_CACHE: Dict[str, Dict[str, Any]] = {}
+    CACHE_TTL = 60 
 
-class StrategyCreate(StrategyBase):
-    pass
+    @classmethod
+    def get_user_plan(cls, user_id: str, supabase: Client) -> str:
+        now = time.time()
+        
+        # 1. Check Cache
+        cached = cls._PLAN_CACHE.get(user_id)
+        if cached and cached["expires_at"] > now:
+            return cached["plan"]
 
-class StrategyUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    emoji: Optional[str] = None
-    color_hex: Optional[str] = None
-    style: Optional[str] = None
-    instrument_types: Optional[List[str]] = None
-    rules: Optional[Dict[str, List[str]]] = None
-    track_missed_trades: Optional[bool] = None
+        # 2. DB Fetch
+        try:
+            # Matches 'user_profiles' table used in trades.py
+            res = supabase.table("user_profiles").select("plan_tier").eq("id", user_id).single().execute()
+            real_plan = (res.data.get("plan_tier") or "FREE").upper()
+        except Exception as e:
+            logger.error(f"Plan fetch failed for {user_id}: {e}")
+            real_plan = "FREE"
 
-class StrategyResponse(StrategyBase):
-    id: str
-    user_id: str
-    created_at: datetime
-    updated_at: Optional[datetime] = None 
+        # 3. Update Cache
+        cls._PLAN_CACHE[user_id] = {
+            "plan": real_plan,
+            "expires_at": now + cls.CACHE_TTL
+        }
+        return real_plan
 
-# --- Dependency ---
+# ---------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------
 
 def get_authenticated_client(creds: HTTPAuthorizationCredentials = Depends(security)) -> Client:
+    """
+    Initializes Supabase Client with ANON key.
+    The .auth() call elevates permissions to the specific user's level via RLS.
+    """
     token = creds.credentials
-    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+    # ✅ SECURITY: Use ANON_KEY to respect RLS policies
+    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
     client.postgrest.auth(token)
     return client
 
-# --- Endpoints ---
+# ---------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------
 
 @router.post("/", response_model=StrategyResponse, status_code=status.HTTP_201_CREATED)
 def create_strategy(
@@ -66,35 +87,43 @@ def create_strategy(
     supabase: Client = Depends(get_authenticated_client)
 ):
     user_id = current_user["sub"]
-    plan_tier = current_user.get("plan_tier", "FREE")
-
-    # -----------------------------------------------------------
-    # 1. QUOTA CHECK: Max Strategies
-    # -----------------------------------------------------------
-    if plan_tier != "FOUNDER":
-        # Fetch limits
-        limits = QuotaManager.get_limits(plan_tier)
-        max_strategies = limits.get("max_strategies", 1)
-
-        # Count existing strategies
-        # We use count="exact" and head=True to avoid fetching actual data (faster)
-        res = supabase.table("strategies") \
-            .select("id", count="exact", head=True) \
-            .eq("user_id", user_id) \
-            .execute()
-        
-        current_count = getattr(res, "count", 0) or 0
-
-        if current_count >= max_strategies:
-            raise HTTPException(
-                status_code=status.HTTP_402_PAYMENT_REQUIRED,
-                detail=f"Strategy limit reached ({current_count}/{max_strategies}). Upgrade to add more."
-            )
-    # -----------------------------------------------------------
-
-    data = strategy.dict()
-    data["user_id"] = user_id
     
+    # 1. Fetch User Plan
+    user_plan = PlanService.get_user_plan(user_id, supabase)
+    
+    # 2. Get Limits from Central Config
+    # Default to FREE limits if plan not found in config
+    plan_limits = settings.PLAN_LIMITS.get(user_plan, settings.PLAN_LIMITS["FREE"])
+    max_strategies = plan_limits.get("strategies", 1)
+
+    # 3. Check Current Count
+    # We use count='exact', head=True to get the number without fetching data rows (Performance)
+    res = supabase.table("strategies") \
+        .select("id", count="exact", head=True) \
+        .eq("user_id", user_id) \
+        .execute()
+    
+    current_count = getattr(res, "count", 0) or 0
+
+    # 4. Enforce Quota
+    if current_count >= max_strategies:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=f"Strategy limit reached ({current_count}/{max_strategies}). Upgrade to add more."
+        )
+
+    # 5. Prepare Data
+    data = strategy.model_dump()
+    data["user_id"] = user_id
+    # Explicit UTC to prevent Postgres timezone issues
+    data["created_at"] = datetime.now(timezone.utc).isoformat()
+    
+    # -----------------------------------------------------------
+    # TODO: AI Embeddings Hook
+    # embedding = generate_embedding(f"{data['name']} {data.get('description')}")
+    # data['embedding'] = embedding
+    # -----------------------------------------------------------
+
     try:
         response = supabase.table("strategies").insert(data).execute()
         if not response.data:
@@ -104,17 +133,26 @@ def create_strategy(
         logger.error(f"DB Error creating strategy: {e}")
         raise HTTPException(status_code=400, detail=f"Database Error: {str(e)}")
 
+
 @router.get("/", response_model=List[StrategyResponse])
 def get_strategies(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
+    user_id = current_user["sub"]
     try:
-        response = supabase.table("strategies").select("*").order("name", desc=False).execute()
+        # Fetch strategies for user, newest first
+        response = supabase.table("strategies")\
+            .select("*")\
+            .eq("user_id", user_id)\
+            .order("created_at", desc=True)\
+            .execute()
+            
         return response.data
     except Exception as e:
         logger.error(f"Error fetching strategies: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch strategies")
+
 
 @router.get("/{strategy_id}", response_model=StrategyResponse)
 def get_strategy(
@@ -133,6 +171,7 @@ def get_strategy(
         logger.error(f"Error fetching strategy {strategy_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+
 @router.patch("/{strategy_id}", response_model=StrategyResponse)
 def update_strategy(
     strategy_id: str,
@@ -140,11 +179,13 @@ def update_strategy(
     current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client)
 ):
-    update_data = {k: v for k, v in strategy.dict().items() if v is not None}
+    # exclude_unset=True ensures we only send fields the user actually changed
+    update_data = strategy.model_dump(exclude_unset=True)
+    
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    update_data["updated_at"] = datetime.now().isoformat()
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     try:
         response = supabase.table("strategies").update(update_data).eq("id", strategy_id).execute()
@@ -157,6 +198,7 @@ def update_strategy(
         logger.error(f"Error updating strategy {strategy_id}: {e}")
         raise HTTPException(status_code=500, detail="Update failed")
 
+
 @router.delete("/{strategy_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_strategy(
     strategy_id: str,
@@ -164,9 +206,10 @@ def delete_strategy(
     supabase: Client = Depends(get_authenticated_client)
 ):
     try:
+        # RLS will ensure user can only delete their own
+        # We assume ON DELETE CASCADE is set on the 'trades' foreign key in DB
+        # If not, you might need to check for existing trades before deleting.
         response = supabase.table("strategies").delete().eq("id", strategy_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Strategy not found")
         return None
     except Exception as e:
         logger.error(f"Error deleting strategy {strategy_id}: {e}")

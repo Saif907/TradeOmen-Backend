@@ -1,8 +1,10 @@
 # backend/app/worker/tasks.py
 import asyncio
+import logging
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Any
-import logging
+from functools import partial
 
 from app.core.config import settings
 
@@ -26,23 +28,39 @@ class BackgroundRunner:
     async def run_in_background(self, func: Callable, *args, **kwargs) -> Any:
         """
         Runs a synchronous function in a separate thread.
-        This is non-blocking for the FastAPI event loop.
+        Waits for the result (non-blocking for the event loop).
         """
         loop = asyncio.get_running_loop()
-        # run_in_executor expects a function and its arguments.
-        # We use a lambda or functools.partial if kwargs are needed, 
-        # but for simple *args this works directly.
-        return await loop.run_in_executor(self.executor, lambda: func(*args, **kwargs))
+        
+        # Capture current context (DB sessions, Request IDs, etc.)
+        ctx = contextvars.copy_context()
+        
+        # Wrap function to run inside the captured context
+        func_with_context = partial(ctx.run, func, *args, **kwargs)
+        
+        return await loop.run_in_executor(self.executor, func_with_context)
 
     def submit_task(self, func: Callable, *args, **kwargs):
         """
-        Fire-and-forget task submission. 
-        Does not wait for the result. Useful for logging, emails, etc.
+        Fire-and-forget task submission.
+        Does NOT wait for the result.
+        Wraps execution to ensure errors are logged.
         """
-        self.executor.submit(func, *args, **kwargs)
+        # Capture context
+        ctx = contextvars.copy_context()
+
+        def safe_wrapper():
+            try:
+                # Run actual function inside correct context
+                ctx.run(func, *args, **kwargs)
+            except Exception as e:
+                logger.error(f"Background task failed: {str(e)}", exc_info=True)
+
+        self.executor.submit(safe_wrapper)
 
     def shutdown(self):
         """Clean up threads on app exit."""
+        logger.info("Shutting down BackgroundRunner...")
         self.executor.shutdown(wait=True)
         logger.info("BackgroundRunner shut down.")
 

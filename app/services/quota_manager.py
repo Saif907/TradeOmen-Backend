@@ -1,56 +1,28 @@
-# backend/app/services/quota_manager.py
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
 from fastapi import HTTPException, status
 from app.core.database import db
+from app.core.config import settings  # ✅ Import Central Config
 
 logger = logging.getLogger(__name__)
-
-class PlanLimits:
-    FREE = {
-        "daily_chat_msgs": 0,
-        "monthly_csv_imports": 1,
-        "allow_web_search": False,
-        "allow_broker_sync": False,
-        "allow_csv_export": False,
-        "max_strategies": 1,
-        "max_total_trades": 100,
-    }
-    PRO = {
-        "daily_chat_msgs": 500,
-        "monthly_csv_imports": 100,
-        "allow_web_search": True,
-        "allow_broker_sync": True,
-        "allow_csv_export": True,
-        "max_strategies": 50,
-        "max_total_trades": 100_000,
-    }
-    FOUNDER = {
-        "daily_chat_msgs": 1_000_000,
-        "monthly_csv_imports": 1_000_000,
-        "allow_web_search": True,
-        "allow_broker_sync": True,
-        "allow_csv_export": True,
-        "max_strategies": 1_000,
-        "max_total_trades": 1_000_000,
-    }
 
 class QuotaManager:
     """
     Central service for enforcing Freemium limits and tracking usage metrics.
+    Limits are now pulled dynamically from app.core.config.settings.PLAN_LIMITS
     """
 
     @staticmethod
     def get_limits(plan_tier: str) -> Dict[str, Any]:
+        """
+        Fetches limits for a specific plan from the central config.
+        Defaults to FREE limits if the plan is unknown.
+        """
         plan_tier = (plan_tier or "FREE").upper()
-        if plan_tier == "FOUNDER":
-            return PlanLimits.FOUNDER
-        elif plan_tier == "PRO":
-            return PlanLimits.PRO
-        else:
-            return PlanLimits.FREE
+        # ✅ Fetch from Central Config
+        return settings.PLAN_LIMITS.get(plan_tier, settings.PLAN_LIMITS["FREE"])
 
     @staticmethod
     def check_feature_access(user_profile: Dict[str, Any], feature_flag: str):
@@ -58,7 +30,7 @@ class QuotaManager:
         Verifies if the user's plan allows a specific boolean feature.
         Raises 403 if denied.
         """
-        plan = user_profile.get("plan_tier", "FREE")
+        plan = user_profile.get("plan_tier", "FREE").upper()
         
         # ✅ Immediate Bypass for Founder
         if plan == "FOUNDER":
@@ -66,6 +38,8 @@ class QuotaManager:
 
         limits = QuotaManager.get_limits(plan)
         
+        # Check if the feature key exists and is True
+        # Note: Your config dictionary keys must match these feature_flags
         if not limits.get(feature_flag, False):
             # Map technical flags to user-friendly names for the error message
             names = {
@@ -89,7 +63,7 @@ class QuotaManager:
         """
         Verifies if a numeric counter has exceeded the plan limit.
         """
-        plan = user_profile.get("plan_tier", "FREE")
+        plan = user_profile.get("plan_tier", "FREE").upper()
         
         # ✅ Immediate Bypass for Founder
         if plan == "FOUNDER":
@@ -103,8 +77,12 @@ class QuotaManager:
         # Check if daily counter needs a reset (Lazy Logic)
         if reset_key:
             last_reset = user_profile.get(reset_key)
-            if not last_reset or (datetime.now(last_reset.tzinfo) - last_reset).days >= 1:
+            # Use timezone-aware comparison if last_reset has tzinfo
+            now = datetime.now(timezone.utc)
+            
+            if not last_reset or (now - last_reset).days >= 1:
                 current_val = 0
+                # We mark this so the caller knows to reset it in DB if needed
                 user_profile["_needs_daily_reset"] = True
 
         if current_val >= limit_val:
@@ -118,16 +96,18 @@ class QuotaManager:
         """
         Checks total trade count against the limit.
         """
-        plan = user_profile.get("plan_tier", "FREE")
+        plan = user_profile.get("plan_tier", "FREE").upper()
         if plan == "FOUNDER": return
 
         limits = QuotaManager.get_limits(plan)
-        max_trades = limits.get("max_total_trades", 100)
+        # ✅ Updated key to match config.py: "trades_per_month" or "max_total_trades"
+        # Based on your config, you used "trades_per_month", but typically storage is total.
+        # Let's assume you meant total storage. Adapting to the config key:
+        max_trades = limits.get("max_total_trades", limits.get("trades_per_month", 100))
 
         if not db.pool: return
 
-        # FIX: Use fetch_one instead of fetch_val if fetch_val is missing
-        # We name the count column explicitly to retrieve it easily
+        # FIX: Use fetch_one instead of fetch_val
         res = await db.fetch_one("SELECT count(*) as count FROM trades WHERE user_id = $1", user_id)
         count = res["count"] if res else 0
         
@@ -177,7 +157,7 @@ class QuotaManager:
     @staticmethod
     async def get_user_usage_report(user_id: str) -> Dict[str, Any]:
         """
-        Fetches current usage metrics.
+        Fetches current usage metrics for the UI dashboard.
         """
         if not db.pool: return {}
         
@@ -188,7 +168,6 @@ class QuotaManager:
         """
         profile_row = await db.fetch_one(profile_query, user_id)
         
-        # FIX: Use fetch_one instead of fetch_val
         trade_res = await db.fetch_one("SELECT count(*) as count FROM trades WHERE user_id = $1", user_id)
         trade_count = trade_res["count"] if trade_res else 0
         
@@ -201,15 +180,17 @@ class QuotaManager:
             "plan": data["plan_tier"],
             "chat": {
                 "used": data["daily_chat_count"],
-                "limit": limits["daily_chat_msgs"]
+                # Fallback to 0 if key missing in config
+                "limit": limits.get("ai_messages_per_day", limits.get("daily_chat_msgs", 0))
             },
             "imports": {
                 "used": data["monthly_import_count"],
-                "limit": limits["monthly_csv_imports"]
+                "limit": limits.get("monthly_csv_imports", 0)
             },
             "trades": {
                 "used": trade_count,
-                "limit": limits["max_total_trades"]
+                # Try both keys just in case config changed
+                "limit": limits.get("max_total_trades", limits.get("trades_per_month", 0))
             },
             "ai_cost_tokens": data["monthly_ai_tokens_used"]
         }
