@@ -68,3 +68,5 @@ uvicorn.pid
 
 # Docker
 docker-data/
+
+edit.txt

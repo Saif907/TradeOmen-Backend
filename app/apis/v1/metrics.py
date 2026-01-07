@@ -1,5 +1,5 @@
 # backend/app/apis/v1/metrics.py
-from fastapi import APIRouter, Depends, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, BackgroundTasks, Query
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
 
@@ -15,27 +15,48 @@ class TelemetryRequest(BaseModel):
     details: Dict[str, Any] = {}
     path: Optional[str] = None
 
+# ---------------------------------------------------------
+# 1. USER ANALYTICS (Behavior & Health)
+# ---------------------------------------------------------
+
 @router.get("/insights", response_model=Dict[str, Any])
 async def get_my_insights(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
     Returns a calculated report of the user's interaction with the platform.
-    Includes: Health Score, Persona, and Usage Stats.
+    Includes: Health Score, Persona, and Plan Limits.
     """
     user_id = current_user["sub"]
     
-    # 1. Get Behavioral Insights
+    # Parallelize these if latency becomes an issue later
     insights = await MetricsEngine.get_user_insights(user_id)
-    
-    # 2. Get Quota Usage (from previous service)
     quota_report = await QuotaManager.get_user_usage_report(user_id)
     
-    # Merge them
     return {
         "insights": insights,
         "quota": quota_report
     }
+
+# ---------------------------------------------------------
+# 2. FINANCIAL ANALYTICS (AI Cost) - NEW
+# ---------------------------------------------------------
+
+@router.get("/ai-usage", response_model=Dict[str, Any])
+async def get_ai_usage_report(
+    days: int = Query(30, ge=1, le=90, description="Lookback period in days"),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Returns detailed AI spend analysis.
+    Useful for 'Settings > Billing' or Admin Dashboards.
+    """
+    user_id = current_user["sub"]
+    return await MetricsEngine.get_ai_spend_analytics(user_id, days)
+
+# ---------------------------------------------------------
+# 3. CLIENT TELEMETRY (Logs from Frontend)
+# ---------------------------------------------------------
 
 @router.post("/telemetry", status_code=201)
 async def report_client_telemetry(
@@ -44,12 +65,11 @@ async def report_client_telemetry(
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """
-    Endpoint for Frontend to log errors or events.
-    Example: Frontend catches a 'Network Error' and sends it here.
+    Log errors/events from the Frontend (e.g., 'Chart Failed to Load').
     """
     user_id = current_user["sub"]
     
-    # Sanitize inputs
+    # Sanitize category
     category = payload.category.upper()
     if category not in ["INFO", "WARNING", "ERROR", "CRITICAL"]:
         category = "INFO"
