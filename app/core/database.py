@@ -1,104 +1,125 @@
 # backend/app/core/database.py
+
 import asyncpg
 import logging
 import ssl
+from contextlib import asynccontextmanager
+from typing import Optional, Any
+
 from tenacity import retry, stop_after_attempt, wait_fixed
 from supabase import create_client, Client
+
 from app.core.config import settings
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tradeomen.database")
+
+
+class DatabaseConnectionError(RuntimeError):
+    pass
+
 
 class Database:
     """
-    High-performance database manager implementing the Hybrid Architecture.
-    
-    1. self.pool (asyncpg): Direct PostgreSQL connection pool for high-speed I/O.
-       WARNING: Bypasses RLS. You MUST manually filter by user_id in all queries.
-       
-    2. self.supabase (Client): Supabase SDK wrapper.
-       Used for: Storage buckets, Auth management, Realtime subscriptions.
+    Industry-grade database manager.
+
+    - asyncpg pool for high-performance queries (RLS BYPASS)
+    - Supabase SDK for auth, storage, realtime
     """
+
     def __init__(self):
-        self.pool: asyncpg.Pool | None = None
-        # Initialize Supabase Client immediately (Stateless/HTTP)
+        self.pool: Optional[asyncpg.Pool] = None
+
         if settings.SUPABASE_URL and settings.SUPABASE_SERVICE_ROLE_KEY:
-            self.supabase: Client = create_client(
-                settings.SUPABASE_URL, 
-                settings.SUPABASE_SERVICE_ROLE_KEY
+            self.supabase: Optional[Client] = create_client(
+                settings.SUPABASE_URL,
+                settings.SUPABASE_SERVICE_ROLE_KEY,
             )
         else:
-            logger.warning("⚠️ Supabase credentials missing. Client not initialized.")
             self.supabase = None
+            logger.warning("Supabase client not initialized (missing credentials)")
+
+    # -------------------------------------------------------------------------
+    # Connection Lifecycle
+    # -------------------------------------------------------------------------
 
     @retry(stop=stop_after_attempt(5), wait=wait_fixed(2))
-    async def connect(self):
-        """
-        Initializes the asyncpg connection pool on startup with robust retry logic.
-        """
+    async def connect(self) -> None:
+        if not settings.DATABASE_DSN:
+            raise DatabaseConnectionError("DATABASE_DSN is not configured")
+
+        logger.info("Initializing PostgreSQL connection pool")
+
         try:
-            logger.info("Connecting to Database via AsyncPG...")
-            
-            if not settings.DATABASE_DSN:
-                raise ValueError("DATABASE_DSN is not set")
+            ssl_context = ssl.create_default_context()
 
-            # Create an SSL context that is compatible with cloud providers (Supabase)
-            # This is often needed to verify the server certificate properly.
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-
-            # INTELLIGENT CONFIGURATION:
-            # If using Supavisor (Port 6543), prepared statements can cause conflicts.
-            # We disable the statement cache to ensure stability in Transaction Mode.
-            statement_cache_size = 0 if ":6543" in settings.DATABASE_DSN else 100
+            statement_cache_size = (
+                0 if ":6543" in settings.DATABASE_DSN else 100
+            )
 
             self.pool = await asyncpg.create_pool(
                 dsn=settings.DATABASE_DSN,
-                min_size=settings.MIN_CONNECTION_POOL_SIZE, # Keep this low (e.g., 5)
-                max_size=settings.MAX_CONNECTION_POOL_SIZE, # Keep this conservative (e.g., 10-15)
-                command_timeout=60,
+                min_size=settings.MIN_CONNECTION_POOL_SIZE,
+                max_size=settings.MAX_CONNECTION_POOL_SIZE,
+                command_timeout=30,
                 statement_cache_size=statement_cache_size,
-                ssl=ctx
+                ssl=ssl_context,
             )
-            
-            # Verify connection
-            async with self.pool.acquire() as connection:
-                await connection.execute("SELECT 1")
-                
-            logger.info("✅ Database Pool Established (AsyncPG).")
-            
-        except Exception as e:
-            logger.critical(f"❌ Database Connection Failed: {e}")
-            raise e
 
-    async def disconnect(self):
-        """
-        Gracefully closes connections on shutdown.
-        """
+            async with self.pool.acquire() as conn:
+                await conn.execute("SELECT 1")
+
+            logger.info("Database pool ready")
+
+        except Exception as exc:
+            logger.critical("Database connection failed", exc_info=True)
+            raise DatabaseConnectionError("Failed to connect to database") from exc
+
+    async def disconnect(self) -> None:
         if self.pool:
             await self.pool.close()
-            logger.info("🛑 Database Pool Closed.")
+            self.pool = None
+            logger.info("Database pool closed")
 
     @property
     def is_connected(self) -> bool:
-        return self.pool is not None
+        return self.pool is not None and not self.pool._closed
 
-    # --- Helper Methods (RLS BYPASS WARNING APPLIES) ---
+    # -------------------------------------------------------------------------
+    # Safety Guard
+    # -------------------------------------------------------------------------
 
-    async def fetch_one(self, query: str, *args):
-        if not self.pool: raise Exception("Database not connected")
-        async with self.pool.acquire() as connection:
-            return await connection.fetchrow(query, *args)
+    def _require_pool(self) -> asyncpg.Pool:
+        if not self.pool:
+            raise DatabaseConnectionError("Database not connected")
+        return self.pool
 
-    async def fetch_all(self, query: str, *args):
-        if not self.pool: raise Exception("Database not connected")
-        async with self.pool.acquire() as connection:
-            return await connection.fetch(query, *args)
+    # -------------------------------------------------------------------------
+    # Query Helpers (RLS BYPASS — CALLERS MUST FILTER BY user_id)
+    # -------------------------------------------------------------------------
 
-    async def execute(self, query: str, *args):
-        if not self.pool: raise Exception("Database not connected")
-        async with self.pool.acquire() as connection:
-            return await connection.execute(query, *args)
+    async def fetch_one(self, query: str, *args) -> Optional[asyncpg.Record]:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            return await conn.fetchrow(query, *args)
 
-# Singleton Database Instance
+    async def fetch_all(self, query: str, *args) -> list[asyncpg.Record]:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            return await conn.fetch(query, *args)
+
+    async def execute(self, query: str, *args) -> str:
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            return await conn.execute(query, *args)
+
+    # -------------------------------------------------------------------------
+    # Transactions (CRITICAL FOR FINANCIAL DATA)
+    # -------------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def transaction(self):
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
 db = Database()

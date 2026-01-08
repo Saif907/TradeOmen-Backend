@@ -6,63 +6,47 @@ from typing import Dict, Any, List
 
 from app.core.database import db
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tradeomen.chat_tools")
 
 class ChatTools:
     """
-    Secure execution layer between LLM and database.
-    This layer enforces safety, limits, and handles Type conversions (UUID).
+    Final security boundary between LLM and database.
+    This MUST be paranoid.
     """
 
-    # -----------------------------
-    # CONFIG (Explicit Whitelists)
-    # -----------------------------
     ALLOWED_TABLES = {"trades", "strategies"}
     ALLOWED_JOIN = "trades.strategy_id = strategies.id"
 
     MAX_ROWS = 30
     MIN_SAMPLE_SIZE = 2
 
-    # Block both standard SQL keywords and Postgres specific system calls
-    FORBIDDEN_KEYWORDS = [
+    STATEMENT_TIMEOUT_MS = 3000  # 3 seconds hard cap
+
+    FORBIDDEN_KEYWORDS = {
         "DROP", "DELETE", "UPDATE", "INSERT", "ALTER",
-        "GRANT", "TRUNCATE", "EXECUTE", "CREATE", "PG_SLEEP",
-        "pg_catalog", "information_schema"
-    ]
+        "GRANT", "TRUNCATE", "EXECUTE", "CREATE",
+        "PG_SLEEP", "pg_catalog", "information_schema",
+        ";"
+    }
 
     # -----------------------------
-    # HELPER: Type Safety
+    # UUID SAFETY
     # -----------------------------
     @staticmethod
     def _to_uuid(user_id: str):
-        """
-        Crucial Helper: Converts string user_id back to UUID object for asyncpg.
-        The Router sends strings (for JSON), but DB driver needs UUID objects.
-        """
-        if isinstance(user_id, str):
-            try:
-                return UUID(user_id)
-            except ValueError:
-                logger.error(f"Invalid UUID string received: {user_id}")
-                # We return the string anyway to let the DB raise the specific error
-                return user_id
-        return user_id
+        try:
+            return UUID(user_id)
+        except Exception:
+            raise ValueError("Invalid user_id")
 
     # -----------------------------
-    # FAST LANE (Standard Metrics)
+    # STANDARD METRICS (SAFE PATH)
     # -----------------------------
     @staticmethod
     async def get_standard_metrics(user_id: str, period: str = "ALL_TIME") -> Dict[str, Any]:
-        """
-        Optimized aggregation for dashboards. 
-        Zero LLM latency, pure SQL speed.
-        """
-        # 1. Convert to UUID
-        uid_obj = ChatTools._to_uuid(user_id)
-        params = [uid_obj]
-        
-        # 2. Build Query
-        date_clause = "1=1"
+        uid = ChatTools._to_uuid(user_id)
+
+        date_clause = "TRUE"
         if period == "LAST_7_DAYS":
             date_clause = "entry_time >= NOW() - INTERVAL '7 days'"
         elif period == "THIS_MONTH":
@@ -82,103 +66,87 @@ class ChatTools:
               AND {date_clause}
         """
 
-        try:
-            row = await db.fetch_one(sql, *params)
+        row = await db.fetch_one(sql, uid)
 
-            if not row or row["total_trades"] == 0:
-                return {
-                    "status": "ok",
-                    "meta": {"row_count": 0, "period": period},
-                    "data": []
-                }
+        if not row or row["total_trades"] == 0:
+            return {"status": "ok", "meta": {"row_count": 0}, "data": []}
 
-            total = row["total_trades"]
-            # Prevent division by zero
-            win_rate = (row["wins"] / total * 100) if total > 0 else 0.0
+        total = row["total_trades"]
+        win_rate = round((row["wins"] / total * 100), 1)
 
-            return {
-                "status": "ok",
-                "meta": {"row_count": 1, "period": period},
-                "data": [{
-                    "period": period,
-                    "total_trades": total,
-                    "net_pnl": float(row["net_pnl"]),
-                    "avg_pnl": float(row["avg_pnl"]),
-                    "win_rate": round(win_rate, 1)
-                }]
-            }
-
-        except Exception as e:
-            logger.error(f"Standard metrics error: {e}")
-            return {"status": "error", "message": f"Failed to calculate metrics: {str(e)}"}
+        return {
+            "status": "ok",
+            "meta": {"row_count": 1},
+            "data": [{
+                "period": period,
+                "total_trades": total,
+                "net_pnl": float(row["net_pnl"]),
+                "avg_pnl": float(row["avg_pnl"]),
+                "win_rate": win_rate
+            }]
+        }
 
     # -----------------------------
-    # FLEXIBLE LANE (Dynamic SQL)
+    # DYNAMIC SQL (STRICT)
     # -----------------------------
     @staticmethod
     async def execute_secure_sql(user_id: str, sql: str) -> Dict[str, Any]:
-        """
-        Executes LLM-generated SQL with strict guardrails and type safety.
-        """
         if not sql:
-            return {"status": "error", "message": "Empty SQL"}
+            raise ValueError("Empty SQL")
 
-        # 1. Normalize & Clean
-        # Remove trailing semicolon to allow appending LIMIT safely
-        sql = sql.strip().rstrip(";")
-        normalized = sql.upper()
+        normalized = sql.strip().upper()
 
-        # 2. Security Rule: Read-only only
+        # 1️⃣ READ-ONLY
         if not (normalized.startswith("SELECT") or normalized.startswith("WITH")):
-            return {"status": "error", "message": "Only SELECT/WITH queries allowed"}
+            raise ValueError("Only SELECT queries allowed")
 
-        # 3. Security Rule: Block forbidden keywords
-        for keyword in ChatTools.FORBIDDEN_KEYWORDS:
-            # Word boundary check (\b) prevents false positives like 'update_at'
-            if re.search(rf"\b{keyword}\b", normalized):
-                return {"status": "error", "message": f"Forbidden keyword detected: {keyword}"}
+        # 2️⃣ BLOCK KEYWORDS
+        for kw in ChatTools.FORBIDDEN_KEYWORDS:
+            if re.search(rf"\b{kw}\b", normalized):
+                raise ValueError("Forbidden SQL detected")
 
-        # 4. Security Rule: Enforce user scope
-        # We check for UPPER case variants since we normalized the string
+        # 3️⃣ USER SCOPE
         if "USER_ID = $1" not in normalized:
-            return {"status": "error", "message": "Query must scope by user_id = $1"}
+            raise ValueError("Missing user scope")
 
-        # 5. Security Rule: Validate tables
-        # Extracts table names after FROM or JOIN
-        tables_found = set(re.findall(r"\bFROM\s+([a-zA-Z0-9_]+)|\bJOIN\s+([a-zA-Z0-9_]+)", normalized))
-        # Flatten the list of tuples returned by findall
-        flat_tables = {t for pair in tables_found for t in pair if t}
+        # 4️⃣ TABLE ALLOWLIST (STRICT)
+        for tbl in ChatTools.ALLOWED_TABLES:
+            normalized = normalized.replace(f"FROM {tbl}", "")
+            normalized = normalized.replace(f"JOIN {tbl}", "")
 
-        if not flat_tables.issubset(ChatTools.ALLOWED_TABLES):
-            return {"status": "error", "message": f"Unauthorized tables accessed. Allowed: {ChatTools.ALLOWED_TABLES}"}
+        if re.search(r"\bFROM\b|\bJOIN\b", normalized):
+            raise ValueError("Unauthorized table access")
 
-        # 6. Enforce LIMIT to protect memory
-        if "LIMIT" not in normalized:
+        # 5️⃣ JOIN CONDITION ENFORCEMENT
+        if "JOIN STRATEGIES" in sql.upper():
+            if ChatTools.ALLOWED_JOIN not in sql:
+                raise ValueError("Invalid JOIN condition")
+
+        # 6️⃣ FORCE LIMIT
+        if "LIMIT" not in sql.upper():
             sql = f"{sql} LIMIT {ChatTools.MAX_ROWS}"
 
+        uid = ChatTools._to_uuid(user_id)
+
         try:
-            # 7. Convert UUID for Execution
-            uid_obj = ChatTools._to_uuid(user_id)
-            
-            # Execute
-            rows = await db.fetch_all(sql, uid_obj)
-            
-            truncated = len(rows) >= ChatTools.MAX_ROWS
-            data = [dict(r) for r in rows]
+            async with db.transaction() as conn:
+                await conn.execute(
+                    f"SET LOCAL statement_timeout = {ChatTools.STATEMENT_TIMEOUT_MS}"
+                )
+                rows = await conn.fetch(sql, uid)
 
-            return {
-                "status": "ok",
-                "meta": {
-                    "row_count": len(data),
-                    "truncated": truncated,
-                    "insufficient_data": len(data) < ChatTools.MIN_SAMPLE_SIZE
-                },
-                "data": data
-            }
+        except Exception:
+            logger.exception("Secure SQL execution failed")
+            raise RuntimeError("Query execution failed")
 
-        except Exception as e:
-            logger.error(f"Secure SQL execution failed: {e} | SQL: {sql}")
-            return {
-                "status": "error",
-                "message": f"Database execution failed: {str(e)}"
-            }
+        data = [dict(r) for r in rows]
+
+        return {
+            "status": "ok",
+            "meta": {
+                "row_count": len(data),
+                "truncated": len(data) >= ChatTools.MAX_ROWS,
+                "insufficient_data": len(data) < ChatTools.MIN_SAMPLE_SIZE
+            },
+            "data": data
+        }

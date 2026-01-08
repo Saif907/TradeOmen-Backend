@@ -1,69 +1,128 @@
 # backend/app/auth/dependency.py
+
+import logging
+from typing import Dict, Any
+
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from app.auth.security import AuthSecurity
+
+from app.auth.security import (
+    AuthSecurity,
+    ExpiredTokenError,
+    InvalidTokenError,
+    InvalidRoleError,
+    AuthenticationError,
+)
 from app.core.database import db
-import logging
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tradeomen.auth.dependency")
 
-# This security scheme extracts the Bearer token from the Authorization header
-security = HTTPBearer()
+security = HTTPBearer(auto_error=True)
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict[str, Any]:
     """
-    FastAPI Dependency to authenticate users via Supabase JWT.
-    
-    Flow:
-    1. Extracts Bearer token from header.
-    2. Validates signature locally (fast) via AuthSecurity.
-    3. Fetches user profile from DB (asyncpg) to get plan/quota info.
-    
-    Returns:
-        dict: The user profile combined with auth claims.
+    Authenticates request and returns a normalized user context.
+
+    Guarantees:
+    - Valid JWT
+    - Authenticated Supabase user
+    - Known user_id
     """
+
     token = credentials.credentials
-    
-    # 1. Verify JWT Signature & Claims
-    auth_payload = AuthSecurity.verify_token(token)
-    user_id = auth_payload.get("sub")
-    
-    if not user_id:
+
+    # ------------------------------------------------------------------
+    # 1. Verify JWT
+    # ------------------------------------------------------------------
+    try:
+        auth_payload = AuthSecurity.verify_token(token)
+    except ExpiredTokenError:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token missing user ID (sub)",
+            detail="Token expired",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except InvalidRoleError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+    except InvalidTokenError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    except AuthenticationError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication failed",
         )
 
-    # 2. Fetch User Profile from Database (High Performance Async)
-    # We use the raw asyncpg pool for maximum speed
+    user_id = auth_payload.get("sub")
+    if not user_id:
+        logger.warning("Authenticated token missing sub claim")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Fetch User Profile (STRICT)
+    # ------------------------------------------------------------------
     try:
-        if db.pool:
-            # ✅ FIXED: Changed table to 'public.user_profiles' (was 'public.profiles')
-            # ✅ FIXED: Removed 'full_name' as it's not in your user_profiles schema
-            query = """
-                SELECT id, active_plan_id, ai_chat_quota_used, preferences
-                FROM public.user_profiles 
-                WHERE id = $1
-            """
-            user_profile = await db.fetch_one(query, user_id)
-            
-            if user_profile:
-                # Merge DB profile data (Plan, Quotas) with Auth token data
-                return {**auth_payload, **dict(user_profile)}
-            
-            logger.warning(f"User {user_id} authenticated but has no user_profiles table entry.")
-            
-        # Fallback: Return just the auth payload if DB lookup fails or profile missing
-        return auth_payload
+        query = """
+            SELECT
+                id,
+                active_plan_id,
+                ai_chat_quota_used,
+                preferences
+            FROM public.user_profiles
+            WHERE id = $1
+        """
 
-    except Exception as e:
-        logger.error(f"Error fetching user profile context: {e}")
-        # Still return auth_payload so the request doesn't fail completely, 
-        # but user might be treated as 'free' tier by default logic.
-        return auth_payload
+        user_profile = await db.fetch_one(query, user_id)
 
-async def get_current_active_user(current_user: dict = Depends(get_current_user)):
+        if not user_profile:
+            logger.warning("Authenticated user missing profile", extra={"user_id": user_id})
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="User profile not found",
+            )
+
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to load user profile", extra={"user_id": user_id})
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="User context unavailable",
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Normalized User Context
+    # ------------------------------------------------------------------
+    return {
+        "user_id": user_profile["id"],
+        "role": auth_payload.get("role"),
+        "email": auth_payload.get("email"),
+        "plan_id": user_profile["active_plan_id"],
+        "ai_chat_quota_used": user_profile["ai_chat_quota_used"],
+        "preferences": user_profile["preferences"],
+        "auth_claims": auth_payload,  # kept for internal use only
+    }
+
+
+async def get_current_active_user(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
     """
-    Dependency wrapper to add future checks (e.g., is_banned, email_verified).
+    Extension point for future checks:
+    - is_banned
+    - email_verified
+    - account_locked
     """
     return current_user

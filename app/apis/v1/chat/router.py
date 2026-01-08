@@ -1,193 +1,218 @@
 # backend/app/apis/v1/chat/router.py
 import logging
-from typing import Dict, Any, List
+import asyncio
+from typing import Dict, Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, status
+from fastapi import APIRouter, Depends, HTTPException, status
+from starlette.concurrency import run_in_threadpool
 from supabase import Client
 
 from app.auth.dependency import get_current_user
 from app.auth.permissions import check_ai_quota
 from app.services.quota_manager import QuotaManager
 from app.services.chat_pipeline import ChatPipeline
+from app.lib.data_sanitizer import sanitizer
 
 from app.schemas.chat_schemas import (
-    ChatRequest, 
-    ChatResponse, 
-    SessionSchema, 
+    ChatRequest,
+    ChatResponse,
+    SessionSchema,
     MessageSchema,
-    ChatUsage
+    ChatUsage,
 )
 from app.apis.v1.chat.dependencies import get_authenticated_client
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tradeomen.chat")
 router = APIRouter()
 
-# ---------------------------------------------------------------------
-# 1. SESSION MANAGEMENT (CRUD)
-# ---------------------------------------------------------------------
 
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def extract_user_id(user: Dict[str, Any]) -> str:
+    uid = user.get("id") or user.get("sub")
+    if not uid:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return str(uid)
+
+
+async def supabase_exec(fn):
+    """Run blocking Supabase SDK calls safely."""
+    return await run_in_threadpool(fn)
+
+
+# ---------------------------------------------------------------------
+# 1. Sessions
+# ---------------------------------------------------------------------
 @router.get("/sessions", response_model=List[SessionSchema])
-def get_sessions(
+async def get_sessions(
     current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
+    supabase: Client = Depends(get_authenticated_client),
 ):
+    user_id = extract_user_id(current_user)
+
     try:
-        # Convert UUID to string just in case
-        user_id = str(current_user["sub"])
-        res = supabase.table("chat_sessions") \
-            .select("id, topic, created_at") \
-            .eq("user_id", user_id) \
-            .order("created_at", desc=True) \
+        res = await supabase_exec(
+            lambda: supabase.table("chat_sessions")
+            .select("id, topic, created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
             .execute()
-        return res.data
-    except Exception as e:
-        logger.error(f"Error fetching sessions: {e}")
-        raise HTTPException(status_code=500, detail="Failed to retrieve sessions")
+        )
+        return res.data or []
+    except Exception:
+        logger.exception("Failed to fetch sessions")
+        raise HTTPException(500, "Failed to retrieve sessions")
 
 
 @router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_session(
+async def delete_session(
     session_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
+    supabase: Client = Depends(get_authenticated_client),
 ):
-    try:
-        user_id = str(current_user["sub"])
-        res = supabase.table("chat_sessions").delete() \
-            .eq("id", session_id).eq("user_id", user_id).execute()
-        
-        if not res.data:
-            raise HTTPException(status_code=404, detail="Session not found")
-        return None
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error deleting session {session_id}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete session")
+    user_id = extract_user_id(current_user)
+
+    res = await supabase_exec(
+        lambda: supabase.table("chat_sessions")
+        .delete()
+        .eq("id", session_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
+
+    if not res.data:
+        raise HTTPException(404, "Session not found")
 
 
 @router.get("/{session_id}/messages", response_model=List[MessageSchema])
-def get_session_history(
+async def get_session_messages(
     session_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
+    supabase: Client = Depends(get_authenticated_client),
 ):
+    user_id = extract_user_id(current_user)
+
     try:
-        res = supabase.table("chat_messages") \
-            .select("role, encrypted_content, created_at") \
-            .eq("session_id", session_id) \
-            .order("created_at") \
+        res = await supabase_exec(
+            lambda: supabase.table("chat_messages")
+            .select("role, content, created_at")
+            .eq("session_id", session_id)
+            .eq("user_id", user_id)
+            .order("created_at")
             .execute()
+        )
 
-        return [
-            {
-                "role": m["role"],
-                "content": m["encrypted_content"],
-                "created_at": m["created_at"]
-            } 
-            for m in res.data or []
-        ]
-    except Exception as e:
-        logger.error(f"Error fetching history: {e}")
-        raise HTTPException(status_code=500, detail="Failed to load history")
+        return res.data or []
+    except Exception:
+        logger.exception("Failed to load messages")
+        raise HTTPException(500, "Failed to load messages")
 
 
 # ---------------------------------------------------------------------
-# 2. MAIN CHAT ENGINE (Fixed UUID Serialization)
+# 2. Main Chat Endpoint
 # ---------------------------------------------------------------------
-
 @router.post("", response_model=ChatResponse)
-async def chat_with_ai(
+async def chat(
     request: ChatRequest,
-    background_tasks: BackgroundTasks,
     user_profile: Dict[str, Any] = Depends(check_ai_quota),
-    supabase: Client = Depends(get_authenticated_client)
+    supabase: Client = Depends(get_authenticated_client),
 ):
-    """
-    The Single Entry Point for the Hybrid Chat System.
-    """
-    # ✅ FIX: Explicitly cast UUID to string for Supabase (JSON) compatibility
-    user_id = str(user_profile["id"])
-    
-    session_id = request.session_id
-    message = request.message.strip()
+    user_id = extract_user_id(user_profile)
 
-    if not message:
-        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    raw_message = (request.message or "").strip()
+    if not raw_message:
+        raise HTTPException(400, "Message cannot be empty")
 
-    # --- A. Session Init ---
+    # ✅ PII-only sanitization (NO encryption)
+    message = sanitizer.sanitize(raw_message)
+
+    session_id: Optional[str] = request.session_id
+
+    # -------------------------------------------------
+    # A. Create session if needed
+    # -------------------------------------------------
     if not session_id:
-        topic = message[:40] + "..."
-        # Pass user_id as string
-        sess_res = supabase.table("chat_sessions") \
-            .insert({"user_id": user_id, "topic": topic}) \
+        topic = raw_message[:40] + ("..." if len(raw_message) > 40 else "")
+        res = await supabase_exec(
+            lambda: supabase.table("chat_sessions")
+            .insert({"user_id": user_id, "topic": topic})
             .execute()
-        
-        if sess_res.data:
-            session_id = sess_res.data[0]["id"]
-        else:
-            raise HTTPException(status_code=500, detail="Failed to initialize session")
-    else:
-        # Ensure incoming session_id is also a string (Pydantic usually handles this, but safe to cast)
-        session_id = str(session_id)
+        )
 
-    # --- B. Fetch Optimized Context ---
+        if not res.data:
+            raise HTTPException(500, "Failed to create session")
+
+        session_id = res.data[0]["id"]
+
+    session_id = str(session_id)
+
+    # -------------------------------------------------
+    # B. Load recent context (last 4 messages)
+    # -------------------------------------------------
     try:
-        hist_res = supabase.table("chat_messages") \
-            .select("role, encrypted_content") \
-            .eq("session_id", session_id) \
-            .order("created_at", desc=True) \
-            .limit(4) \
+        hist = await supabase_exec(
+            lambda: supabase.table("chat_messages")
+            .select("role, content")
+            .eq("session_id", session_id)
+            .order("created_at", desc=True)
+            .limit(4)
             .execute()
-        
-        history = [
-            {"role": r["role"], "content": r["encrypted_content"]} 
-            for r in reversed(hist_res.data or [])
-        ]
+        )
+        history = list(reversed(hist.data or []))
     except Exception:
         history = []
 
-    # --- C. Save User Message ---
-    # user_id and session_id are now guaranteed to be strings
-    supabase.table("chat_messages").insert({
-        "session_id": session_id,
-        "user_id": user_id,
-        "role": "user",
-        "encrypted_content": message
-    }).execute()
+    # -------------------------------------------------
+    # C. Store user message (sanitized)
+    # -------------------------------------------------
+    await supabase_exec(
+        lambda: supabase.table("chat_messages").insert({
+            "session_id": session_id,
+            "user_id": user_id,
+            "role": "user",
+            "content": message,
+        }).execute()
+    )
 
-    # --- D. PROCESS (The Brain) ---
+    # -------------------------------------------------
+    # D. Run Chat Pipeline
+    # -------------------------------------------------
     try:
-        # Pass user_id as string to the pipeline too
         response_text = await ChatPipeline.process(user_id, message, history)
-    except Exception as e:
-        logger.exception(f"Pipeline Critical Failure: {e}")
-        response_text = "I encountered a critical system error. Please try again later."
+    except Exception:
+        logger.exception("Chat pipeline failure")
+        response_text = "Something went wrong. Please try again."
 
-    # --- E. Save AI Response ---
-    supabase.table("chat_messages").insert({
-        "session_id": session_id,
-        "user_id": user_id,
-        "role": "assistant",
-        "encrypted_content": response_text
-    }).execute()
+    sanitized_response = sanitizer.sanitize(response_text)
 
-    # --- F. Background Metrics ---
-    total_chars = len(message) + len(response_text)
-    est_tokens = int(total_chars / 4)
+    # -------------------------------------------------
+    # E. Store assistant response
+    # -------------------------------------------------
+    await supabase_exec(
+        lambda: supabase.table("chat_messages").insert({
+            "session_id": session_id,
+            "user_id": user_id,
+            "role": "assistant",
+            "content": sanitized_response,
+        }).execute()
+    )
 
-    background_tasks.add_task(
-        QuotaManager.increment_usage,
-        user_id=user_id,
-        metric_type="chat_message",
-        extra_data={
-            "tokens": est_tokens,
-            "needs_reset": user_profile.get("_needs_daily_reset", False)
-        }
+    # -------------------------------------------------
+    # F. Usage tracking (async, non-blocking)
+    # -------------------------------------------------
+    est_tokens = max(1, int((len(message) + len(response_text)) / 4))
+
+    asyncio.create_task(
+        QuotaManager.increment_usage(
+            user_id=user_id,
+            metric_type="chat_message",
+            extra_data={"tokens": est_tokens}
+        )
     )
 
     return {
         "response": response_text,
         "session_id": session_id,
-        "usage": ChatUsage(total_tokens=est_tokens)
+        "usage": ChatUsage(total_tokens=est_tokens),
     }

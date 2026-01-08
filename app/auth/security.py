@@ -1,69 +1,68 @@
 # backend/app/auth/security.py
-from jose import jwt, JWTError
-from fastapi import HTTPException, status
-from app.core.config import settings
+
 import logging
 from typing import Dict, Any
 
-logger = logging.getLogger(__name__)
+from jose import jwt, JWTError, ExpiredSignatureError
+
+from app.core.config import settings
+
+logger = logging.getLogger("tradeomen.auth.security")
+
+
+class AuthenticationError(Exception):
+    """Base authentication error."""
+
+
+class InvalidTokenError(AuthenticationError):
+    """Token is malformed or invalid."""
+
+
+class ExpiredTokenError(AuthenticationError):
+    """Token has expired."""
+
+
+class InvalidRoleError(AuthenticationError):
+    """User role is not allowed."""
+
 
 class AuthSecurity:
     """
-    Handles cryptographic verification of Supabase JWTs locally.
-    This avoids an expensive HTTP round-trip to Supabase Auth for every API request.
+    Cryptographically verifies Supabase-issued JWTs locally.
+    No HTTP or FastAPI dependencies.
     """
-    
+
     @staticmethod
     def verify_token(token: str) -> Dict[str, Any]:
-        """
-        Decodes and validates a JWT token.
-        
-        Args:
-            token (str): The raw JWT string from the Authorization header.
-            
-        Returns:
-            Dict[str, Any]: The decoded user payload (sub, email, role, metadata).
-            
-        Raises:
-            HTTPException: If token is expired, invalid, or signature verification fails.
-        """
         try:
-            # Decode the token using the Supabase JWT Secret
-            # verify_exp=True ensures we reject expired tokens automatically
             payload = jwt.decode(
-                token, 
-                settings.SECRET_KEY, 
+                token,
+                settings.SUPABASE_JWT_SECRET,
                 algorithms=[settings.ALGORITHM],
-                options={"verify_aud": False} # Supabase JWTs often don't have a standard 'aud' claim for the API
+                issuer=settings.SUPABASE_JWT_ISSUER,
+                options={
+                    "verify_aud": False,   # Supabase API tokens often omit aud
+                    "require": ["exp", "sub", "iss"],
+                },
             )
-            
-            # Additional check: Ensure it's an authenticated user, not an anonymous one (if you block anon)
-            if payload.get("role") != "authenticated":
-                logger.warning(f"Rejected token with role: {payload.get('role')}")
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Invalid user role"
-                )
-                
+
+            role = payload.get("role")
+            if role != "authenticated":
+                raise InvalidRoleError(f"Unauthorized role: {role}")
+
             return payload
 
-        except jwt.ExpiredSignatureError:
-            logger.info("Token expired")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token expired",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        except JWTError as e:
-            logger.error(f"JWT Verification Failed: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Could not validate credentials",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        except Exception as e:
-            logger.error(f"Unexpected Auth Error: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Authentication service error"
-            )
+        except ExpiredSignatureError:
+            logger.info("JWT expired")
+            raise ExpiredTokenError("Token expired")
+
+        except JWTError:
+            logger.warning("JWT verification failed")
+            raise InvalidTokenError("Invalid authentication token")
+
+        except AuthenticationError:
+            raise
+
+        except Exception:
+            logger.exception("Unexpected authentication error")
+            raise AuthenticationError("Authentication failure")

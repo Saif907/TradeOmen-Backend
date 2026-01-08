@@ -1,95 +1,143 @@
 # backend/app/lib/llm_client.py
-import httpx
-from typing import List, Dict, Any, Optional
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import logging
 import time
 import json
+from typing import List, Dict, Any, Optional, AsyncIterator, Tuple
+
+import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from app.core.config import settings
-from app.lib.data_sanitizer import sanitizer 
+from app.lib.data_sanitizer import sanitizer
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("tradeomen.llm_client")
 
+
+# -------------------------------------------------------------------
+# Exceptions
+# -------------------------------------------------------------------
+class LLMError(Exception):
+    pass
+
+
+class ProviderError(LLMError):
+    pass
+
+
+class RateLimitError(LLMError):
+    def __init__(self, retry_after: Optional[int] = None):
+        self.retry_after = retry_after
+        super().__init__("Rate limited by provider")
+
+
+# -------------------------------------------------------------------
+# Retry predicate (NON-STREAM ONLY)
+# -------------------------------------------------------------------
+def _should_retry(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.ConnectError, httpx.ReadTimeout, httpx.TransportError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (429, 500, 502, 503, 504)
+    return False
+
+
+# -------------------------------------------------------------------
+# LLM Client
+# -------------------------------------------------------------------
 class LLMClient:
-    """
-    Async client for orchestrating calls to multiple LLM providers.
-    Includes automatic PII sanitization (Privacy by Design).
-    """
-    
     def __init__(self):
-        # Shared async client for connection pooling
-        # Explicitly trust_env=False to ignore potentially malformed system proxy settings during dev
-        self.client = httpx.AsyncClient(timeout=60.0, trust_env=True)
-        
+        timeout = getattr(settings, "LLM_REQUEST_TIMEOUT_SECONDS", 60.0)
+        self.client = httpx.AsyncClient(timeout=timeout, trust_env=True)
+
     async def close(self):
         await self.client.aclose()
 
+    # ===============================================================
+    # NON-STREAMING (SAFE TO RETRY)
+    # ===============================================================
     @retry(
+        retry=retry_if_exception(_should_retry),
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((httpx.ConnectError, httpx.ReadTimeout, httpx.HTTPStatusError))
+        wait=wait_exponential(multiplier=1, min=1, max=10),
     )
     async def generate_response(
-        self, 
-        messages: List[Dict[str, str]], 
-        model: str = "gemini-2.5-flash", 
-        provider: str = "gemini",
+        self,
+        messages: List[Dict[str, str]],
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 1000,
-        response_format: Optional[Dict] = None
+        response_format: Optional[Dict] = None,
     ) -> Dict[str, Any]:
-        """
-        Main orchestration method. Routes request to the specific provider handler.
-        """
-        start_time = time.time()
-        
-        # ✅ PRIVACY STEP: Sanitize inputs
-        safe_messages = []
-        for msg in messages:
-            clean_msg = msg.copy()
-            if "content" in clean_msg and isinstance(clean_msg["content"], str):
-                clean_msg["content"] = sanitizer.sanitize(clean_msg["content"])
-            safe_messages.append(clean_msg)
+
+        start = time.time()
+        safe_messages = self._sanitize(messages)
+
+        provider = (provider or settings.LLM_PROVIDER).lower()
+        model = model or settings.LLM_MODEL
 
         try:
             if provider == "openai":
-                response = await self._call_openai(safe_messages, model, temperature, max_tokens, response_format)
-            elif provider == "perplexity":
-                response = await self._call_perplexity(safe_messages, model, temperature, max_tokens)
+                res = await self._call_openai(safe_messages, model, temperature, max_tokens, response_format)
             elif provider == "gemini":
-                response = await self._call_gemini(safe_messages, model, temperature, max_tokens)
+                res = await self._call_gemini(safe_messages, model, temperature, max_tokens)
             else:
-                raise ValueError(f"Unsupported LLM provider: {provider}")
+                raise LLMError(f"Unsupported provider: {provider}")
 
-            duration = time.time() - start_time
-            
             return {
-                "content": response.get("content", ""),
-                "usage": response.get("usage", {}),
-                "model": response.get("model", model),
-                "duration": duration,
-                "provider": provider
+                "content": res["content"],
+                "usage": self._normalize_usage(res.get("usage")),
+                "model": res.get("model", model),
+                "provider": provider,
+                "duration": time.time() - start,
             }
 
-        except httpx.UnsupportedProtocol as e:
-            logger.critical(f"🚨 Protocol Error calling {provider}: {str(e)}")
-            raise HTTPException(status_code=500, detail="Internal Configuration Error: Invalid API URL")
         except httpx.HTTPStatusError as e:
-            logger.error(f"LLM Provider Error ({provider}): {e.response.status_code} - {e.response.text}")
-            raise e
+            if e.response.status_code == 429:
+                raise RateLimitError(self._retry_after(e.response))
+            raise ProviderError(f"Provider error {e.response.status_code}")
         except Exception as e:
-            logger.error(f"LLM Internal Error: {str(e)}")
-            raise e
+            logger.exception("LLM error")
+            raise LLMError(str(e))
 
-    # --- Provider Implementations ---
+    # ===============================================================
+    # STREAMING (NO RETRIES)
+    # ===============================================================
+    async def stream_response(
+        self,
+        messages: List[Dict[str, str]],
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 1000,
+    ) -> AsyncIterator[Tuple[str, Dict[str, Any]]]:
 
+        safe_messages = self._sanitize(messages)
+        provider = (provider or settings.LLM_PROVIDER).lower()
+        model = model or settings.LLM_MODEL
+
+        if provider == "openai":
+            async for chunk in self._stream_openai(safe_messages, model, temperature, max_tokens):
+                yield chunk, {"event": "delta"}
+            yield "", {"event": "done"}
+            return
+
+        if provider == "gemini":
+            async for chunk in self._stream_gemini(safe_messages, model, temperature, max_tokens):
+                yield chunk, {"event": "delta"}
+            yield "", {"event": "done"}
+            return
+
+        # fallback (single chunk)
+        res = await self.generate_response(messages, model=model, provider=provider)
+        yield res["content"], {"event": "final", "usage": res["usage"]}
+
+    # ===============================================================
+    # PROVIDERS
+    # ===============================================================
     async def _call_openai(self, messages, model, temperature, max_tokens, response_format):
         url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
+        headers = {"Authorization": f"Bearer {settings.OPENAI_API_KEY}"}
         payload = {
             "model": model,
             "messages": messages,
@@ -97,108 +145,125 @@ class LLMClient:
             "max_tokens": max_tokens,
         }
         if response_format:
-            payload["response_format"] = response_format
+            payload.update(response_format)
 
-        resp = await self.client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        
+        r = await self.client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        j = r.json()
         return {
-            "content": data["choices"][0]["message"]["content"],
-            "usage": data.get("usage", {}),
-            "model": data.get("model")
-        }
-
-    async def _call_perplexity(self, messages, model, temperature, max_tokens):
-        url = "https://api.perplexity.ai/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {settings.PERPLEXITY_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        # ✅ Logic to handle 'sonar' model request
-        if model == "sonar":
-            pplx_model = "sonar" # Use the generic latest model
-        elif "sonar" in model:
-            pplx_model = model
-        else:
-            pplx_model = "sonar-medium-online" # Fallback
-            
-        payload = {
-            "model": pplx_model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-
-        logger.info(f"📤 Calling Perplexity API: {url} with model {pplx_model}")
-        resp = await self.client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
-        return {
-            "content": data["choices"][0]["message"]["content"],
-            "usage": data.get("usage", {}),
-            "model": data.get("model")
+            "content": j["choices"][0]["message"]["content"],
+            "usage": j.get("usage", {}),
+            "model": j.get("model", model),
         }
 
     async def _call_gemini(self, messages, model, temperature, max_tokens):
-        gemini_model = "gemini-2.5-flash" if "gpt" in model or "sonar" in model else model
-        
-        # Ensure Key is present
-        api_key = settings.GEMINI_API_KEY
-        if not api_key:
-            logger.error("❌ GEMINI_API_KEY is missing!")
-            raise ValueError("GEMINI_API_KEY is not set")
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.GEMINI_API_KEY}"
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={api_key}"
-        
-        # Clean URL (just in case of whitespace injection)
-        url = url.strip()
+        contents, system = [], None
+        for m in messages:
+            if m["role"] == "system":
+                system = {"parts": [{"text": m["content"]}]}
+            elif m["role"] == "user":
+                contents.append({"role": "user", "parts": [{"text": m["content"]}]})
+            elif m["role"] == "assistant":
+                contents.append({"role": "model", "parts": [{"text": m["content"]}]})
 
-        contents = []
-        system_instruction = None
-        
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            
-            if role == "system":
-                system_instruction = {"parts": [{"text": content}]}
-            elif role == "user":
-                contents.append({"role": "user", "parts": [{"text": content}]})
-            elif role == "assistant":
-                contents.append({"role": "model", "parts": [{"text": content}]})
+        payload = {"contents": contents, "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}}
+        if system:
+            payload["systemInstruction"] = system
 
+        r = await self.client.post(url, json=payload)
+        r.raise_for_status()
+        j = r.json()
+
+        text = j["candidates"][0]["content"]["parts"][0]["text"]
+        usage = j.get("usageMetadata", {})
+        return {"content": text, "usage": usage, "model": model}
+
+    # ===============================================================
+    # STREAMING PROVIDERS
+    # ===============================================================
+    async def _stream_openai(self, messages, model, temperature, max_tokens):
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {settings.OPENAI_API_KEY}"}
         payload = {
-            "contents": contents,
-            "generationConfig": {
-                "temperature": temperature,
-                "maxOutputTokens": max_tokens
-            }
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
         }
-        
-        if system_instruction:
-            payload["systemInstruction"] = system_instruction
 
-        logger.info(f"📤 Calling Gemini API: {url.split('?')[0]}...") # Log without key
-        
-        resp = await self.client.post(url, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        
+        async with self.client.stream("POST", url, headers=headers, json=payload) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    return
+                j = json.loads(data)
+                delta = j["choices"][0]["delta"].get("content")
+                if delta:
+                    yield delta
+
+    async def _stream_gemini(self, messages, model, temperature, max_tokens):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?key={settings.GEMINI_API_KEY}"
+
+        contents, system = [], None
+        for m in messages:
+            if m["role"] == "system":
+                system = {"parts": [{"text": m["content"]}]}
+            elif m["role"] == "user":
+                contents.append({"role": "user", "parts": [{"text": m["content"]}]})
+            elif m["role"] == "assistant":
+                contents.append({"role": "model", "parts": [{"text": m["content"]}]})
+
+        payload = {"contents": contents, "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens}}
+        if system:
+            payload["systemInstruction"] = system
+
+        async with self.client.stream("POST", url, json=payload) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                    parts = data["candidates"][0]["content"]["parts"]
+                    for p in parts:
+                        if "text" in p:
+                            yield p["text"]
+                except Exception:
+                    continue
+
+    # ===============================================================
+    # HELPERS
+    # ===============================================================
+    def _sanitize(self, messages):
+        out = []
+        for m in messages:
+            m2 = dict(m)
+            if isinstance(m2.get("content"), str) and getattr(settings, "SANITIZE_PII", True):
+                m2["content"] = sanitizer.sanitize(m2["content"])
+            out.append(m2)
+        return out
+
+    def _normalize_usage(self, usage: Dict[str, Any]) -> Dict[str, int]:
+        if not usage:
+            return {"total_tokens": 0}
+        if "totalTokenCount" in usage:
+            return {"total_tokens": int(usage["totalTokenCount"])}
+        if "total_tokens" in usage:
+            return {"total_tokens": int(usage["total_tokens"])}
+        return {"total_tokens": 0}
+
+    def _retry_after(self, response: httpx.Response) -> Optional[int]:
         try:
-            content = data["candidates"][0]["content"]["parts"][0]["text"]
-            usage = {"total_tokens": data.get("usageMetadata", {}).get("totalTokenCount", 0)}
-        except (KeyError, IndexError):
-            content = ""
-            usage = {}
+            return int(response.headers.get("Retry-After"))
+        except Exception:
+            return None
 
-        return {
-            "content": content,
-            "usage": usage,
-            "model": gemini_model
-        }
 
-# Singleton instance
+# Singleton
 llm_client = LLMClient()
