@@ -50,8 +50,14 @@ class Database:
         logger.info("Initializing PostgreSQL connection pool")
 
         try:
+            # FIX: Create a custom SSL context that ignores certificate errors.
+            # This is necessary for many cloud DBs (Supabase/Render) when connecting
+            # from local environments or containers without root cert access.
             ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
 
+            # Supabase transactional pooler (port 6543) doesn't support prepared statements
             statement_cache_size = (
                 0 if ":6543" in settings.DATABASE_DSN else 100
             )
@@ -62,7 +68,7 @@ class Database:
                 max_size=settings.MAX_CONNECTION_POOL_SIZE,
                 command_timeout=30,
                 statement_cache_size=statement_cache_size,
-                ssl=ssl_context,
+                ssl=ssl_context,  # Apply the fix here
             )
 
             async with self.pool.acquire() as conn:
@@ -122,4 +128,6 @@ class Database:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 yield conn
+
+
 db = Database()

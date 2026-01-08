@@ -3,7 +3,8 @@
 import logging
 from typing import Any, Dict
 
-from fastapi import Request, status
+# 1. ADD 'FastAPI' TO THIS IMPORT
+from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -43,7 +44,6 @@ async def global_exception_handler(request: Request, exc: Exception):
     """
     Catch-all handler for unexpected server errors.
     """
-
     logger.exception(
         "Unhandled exception",
         extra={
@@ -71,7 +71,6 @@ async def http_exception_handler(
     """
     Handles HTTP exceptions raised explicitly by the application.
     """
-
     log_level = logging.WARNING if exc.status_code < 500 else logging.ERROR
 
     logger.log(
@@ -103,14 +102,16 @@ async def validation_exception_handler(
     """
     Handles request validation errors.
     """
-
     formatted_errors = []
 
     for error in exc.errors():
-        location = ".".join(str(x) for x in error.get("loc", []))
+        # Get the field name, defaulting to "body" if location is empty
+        loc = error.get("loc", [])
+        location = ".".join(str(x) for x in loc) if loc else "body"
+        
         formatted_errors.append(
             {
-                "field": location or "body",
+                "field": location,
                 "message": error.get("msg"),
                 "type": error.get("type"),
             }
@@ -131,3 +132,16 @@ async def validation_exception_handler(
         message="Invalid request data",
         details=formatted_errors,
     )
+
+
+# ------------------------------------------------------------------------------
+# Registration Function
+# ------------------------------------------------------------------------------
+
+def register_exception_handlers(app: FastAPI):
+    """
+    Registers the exception handlers with the FastAPI app instance.
+    """
+    app.add_exception_handler(Exception, global_exception_handler)
+    app.add_exception_handler(StarletteHTTPException, http_exception_handler)
+    app.add_exception_handler(RequestValidationError, validation_exception_handler)

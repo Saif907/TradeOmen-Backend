@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 # --------------------------------------------------
 # Load .env ONLY for non-production environments
 # --------------------------------------------------
-if os.getenv("APP_ENV") != "production":
+if os.getenv("ENVIRONMENT") != "production":
     load_dotenv()
 
 
@@ -43,12 +43,18 @@ class Settings(BaseSettings):
     )
 
     # --------------------------------------------------
-    # 1. Environment
+    # 1. Environment & Project Info
     # --------------------------------------------------
-    APP_NAME: str = "TradeOmen AI Backend"
+    # Renamed APP_NAME -> PROJECT_NAME to match main.py
+    PROJECT_NAME: str = "TradeOmen AI Backend" 
     APP_VERSION: str = "1.2.0"
-    APP_ENV: AppEnvironment = "development"
+    
+    # Renamed APP_ENV -> ENVIRONMENT to match main.py
+    ENVIRONMENT: AppEnvironment = "development" 
     LOG_LEVEL: str = "INFO"
+    
+    # Added API prefix to match main.py expectations
+    API_V1_STR: str = "/api/v1"
 
     # ---- CONSTANTS (NOT ENV FIELDS) ----
     VALID_LOG_LEVELS: ClassVar[Set[str]] = {
@@ -62,22 +68,22 @@ class Settings(BaseSettings):
     @computed_field
     @property
     def IS_DEV(self) -> bool:
-        return self.APP_ENV == "development"
+        return self.ENVIRONMENT == "development"
 
     @computed_field
     @property
     def IS_TEST(self) -> bool:
-        return self.APP_ENV == "test"
+        return self.ENVIRONMENT == "test"
 
     @computed_field
     @property
     def IS_STAGING(self) -> bool:
-        return self.APP_ENV == "staging"
+        return self.ENVIRONMENT == "staging"
 
     @computed_field
     @property
     def IS_PROD(self) -> bool:
-        return self.APP_ENV == "production"
+        return self.ENVIRONMENT == "production"
 
     # --------------------------------------------------
     # 2. Server
@@ -88,9 +94,10 @@ class Settings(BaseSettings):
     # --------------------------------------------------
     # 3. CORS
     # --------------------------------------------------
-    CORS_ALLOWED_ORIGINS: List[AnyHttpUrl] = []
+    # Renamed CORS_ALLOWED_ORIGINS -> BACKEND_CORS_ORIGINS to match main.py
+    BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = []
 
-    @field_validator("CORS_ALLOWED_ORIGINS", mode="before")
+    @field_validator("BACKEND_CORS_ORIGINS", mode="before")
     @classmethod
     def assemble_cors_origins(cls, v: Union[str, List[str]]) -> List[str]:
         if isinstance(v, str) and not v.startswith("["):

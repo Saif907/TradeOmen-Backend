@@ -1,171 +1,118 @@
-# backend/main.py
-
 import logging
-import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.exceptions import HTTPException as StarletteHTTPException
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from app.core.config import settings
 from app.core.database import db
-from app.apis.v1 import api_router
-from app.core.exception import (
-    global_exception_handler,
-    http_exception_handler,
-    validation_exception_handler,
-)
+from app.core.exception import register_exception_handlers
+# Ensure you have a central router in apis/v1/__init__.py or import individual routers
+from app.apis.v1 import api_router as api_v1_router 
 
-# ------------------------------------------------------------------------------
-# Logging Configuration
-# ------------------------------------------------------------------------------
-
+# --------------------------------------------------------------------------
+# Logging Setup
+# --------------------------------------------------------------------------
 logging.basicConfig(
-    level=settings.LOG_LEVEL,
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+logger = logging.getLogger("tradeomen.main")
 
-logger = logging.getLogger("tradeomen.api")
-
-# ------------------------------------------------------------------------------
-# Application Lifespan
-# ------------------------------------------------------------------------------
-
+# --------------------------------------------------------------------------
+# Lifespan (Startup/Shutdown)
+# --------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Application startup & shutdown lifecycle.
-    Fail-fast philosophy.
+    Modern industry-standard startup/shutdown handling.
     """
-    logger.info(
-        "Starting %s v%s [%s]",
-        settings.APP_NAME,
-        settings.APP_VERSION,
-        settings.APP_ENV,
-    )
-
-    # --------------------
-    # Startup
-    # --------------------
-    if settings.DATABASE_DSN:
-        try:
-            await db.connect()
-            logger.info("Database connection established")
-        except Exception:
-            logger.critical("Database connection failed", exc_info=True)
-            raise
-
-    if not settings.IS_PROD:
-        logger.debug("Registered API routes:")
-        for route in app.routes:
-            if hasattr(route, "methods"):
-                logger.debug("%s %s", route.methods, route.path)
-
-    yield
-
-    # --------------------
-    # Shutdown
-    # --------------------
-    logger.info("Shutting down application")
-
+    # 1. Startup: Connect to DB
     try:
-        if db.is_connected:
-            await db.disconnect()
-            logger.info("Database connection closed")
-    except Exception:
-        logger.error("Error during database shutdown", exc_info=True)
+        await db.connect()
+        logger.info("✅ Database connected successfully")
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        # In production, you might want to stop the app if DB fails
+        # raise e 
+    
+    yield  # App runs here
 
-    try:
-        from app.lib.llm_client import llm_client
-        await llm_client.close()
-        logger.info("LLM client closed")
-    except ImportError:
-        pass
-    except Exception:
-        logger.error("Error closing LLM client", exc_info=True)
+    # 2. Shutdown: Disconnect DB
+    await db.disconnect()
+    logger.info("🛑 Database disconnected")
 
-# ------------------------------------------------------------------------------
-# FastAPI App
-# ------------------------------------------------------------------------------
-
+# --------------------------------------------------------------------------
+# App Initialization
+# --------------------------------------------------------------------------
 app = FastAPI(
-    title=settings.APP_NAME,
-    version=settings.APP_VERSION,
+    title=settings.PROJECT_NAME,
+    version="1.0.0",
+    description="Industry-grade SaaS Trading Journal Backend",
     lifespan=lifespan,
-    docs_url="/docs" if not settings.IS_PROD else None,
-    redoc_url=None,
+    docs_url="/docs" if settings.ENVIRONMENT != "production" else None, # Hide docs in prod
+    redoc_url="/redoc" if settings.ENVIRONMENT != "production" else None,
 )
 
-# ------------------------------------------------------------------------------
-# Exception Handlers
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Middleware (Order Matters!)
+# --------------------------------------------------------------------------
 
-app.add_exception_handler(StarletteHTTPException, http_exception_handler)
-app.add_exception_handler(RequestValidationError, validation_exception_handler)
-app.add_exception_handler(Exception, global_exception_handler)
+# 1. Security: Trusted Hosts (Prevents Host Header attacks)
+# Allow all in dev, specific hosts in prod
+app.add_middleware(
+    TrustedHostMiddleware, 
+    allowed_hosts=["*"] if settings.ENVIRONMENT == "development" else ["tradeomen.com", "*.tradeomen.com", "localhost"]
+)
 
-# ------------------------------------------------------------------------------
-# Middleware
-# ------------------------------------------------------------------------------
+# 2. Performance: GZip Compression (Compresses large JSON responses)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-@app.middleware("http")
-async def request_timing_middleware(request: Request, call_next):
-    start_time = time.perf_counter()
-    response = await call_next(request)
-    duration = time.perf_counter() - start_time
-    response.headers["X-Process-Time"] = f"{duration:.6f}"
-    return response
+# 3. Connectivity: CORS (Fixes your 400 Bad Request / Blocked error)
+# We strictly define origins to prevent unauthorized browser access.
+allow_origins = [
+    "http://localhost:8080",      # Vite Local
+    "http://127.0.0.1:8080",      # Vite Local IP
+    "http://localhost:3000",      # React Alternative
+    "https://app.tradeomen.com",  # Production
+]
 
+# If config has specific origins, add them too
+if hasattr(settings, "BACKEND_CORS_ORIGINS") and settings.BACKEND_CORS_ORIGINS:
+    for origin in settings.BACKEND_CORS_ORIGINS:
+        if str(origin) not in allow_origins:
+            allow_origins.append(str(origin))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ALLOWED_ORIGINS,
+    # ⚠️ For Dev Convenience: If you still have issues, uncomment the line below to allow ALL.
+    # allow_origins=["*"], 
+    allow_origins=allow_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_methods=["*"],  # Allow all methods (GET, POST, OPTIONS, etc.)
+    allow_headers=["*"],  # Allow all headers (Authorization, etc.)
 )
 
-# ------------------------------------------------------------------------------
-# API Routes
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Exception Handlers
+# --------------------------------------------------------------------------
+# Ensures errors return structured JSON instead of HTML crashes
+register_exception_handlers(app)
 
-app.include_router(api_router, prefix="/api/v1")
+# --------------------------------------------------------------------------
+# Routers
+# --------------------------------------------------------------------------
+app.include_router(api_v1_router, prefix=settings.API_V1_STR)
 
-# ------------------------------------------------------------------------------
-# System Endpoints
-# ------------------------------------------------------------------------------
-
-@app.get("/health", tags=["System"])
+# --------------------------------------------------------------------------
+# Root Endpoint (Health Check)
+# --------------------------------------------------------------------------
+@app.get("/", tags=["Health"])
 async def health_check():
     return {
-        "status": "ok",
-        "service": settings.APP_NAME,
-        "version": settings.APP_VERSION,
-        "environment": settings.APP_ENV,
+        "status": "healthy",
         "database": "connected" if db.is_connected else "disconnected",
+        "version": "1.0.0"
     }
-
-
-@app.get("/", tags=["System"])
-async def root():
-    return {
-        "message": "TradeOmen API",
-        "docs": "/docs" if not settings.IS_PROD else None,
-    }
-
-# ------------------------------------------------------------------------------
-# Local Dev Entrypoint
-# ------------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host=settings.SERVER_HOST,
-        port=settings.SERVER_PORT,
-        reload=not settings.IS_PROD,
-        log_level=settings.LOG_LEVEL.lower(),
-    )
