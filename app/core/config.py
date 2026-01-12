@@ -45,24 +45,15 @@ class Settings(BaseSettings):
     # --------------------------------------------------
     # 1. Environment & Project Info
     # --------------------------------------------------
-    # Renamed APP_NAME -> PROJECT_NAME to match main.py
-    PROJECT_NAME: str = "TradeOmen AI Backend" 
+    PROJECT_NAME: str = "TradeOmen AI Backend"
     APP_VERSION: str = "1.2.0"
-    
-    # Renamed APP_ENV -> ENVIRONMENT to match main.py
-    ENVIRONMENT: AppEnvironment = "development" 
+    ENVIRONMENT: AppEnvironment = "development"
     LOG_LEVEL: str = "INFO"
-    
-    # Added API prefix to match main.py expectations
     API_V1_STR: str = "/api/v1"
 
     # ---- CONSTANTS (NOT ENV FIELDS) ----
     VALID_LOG_LEVELS: ClassVar[Set[str]] = {
-        "DEBUG",
-        "INFO",
-        "WARNING",
-        "ERROR",
-        "CRITICAL",
+        "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL",
     }
 
     @computed_field
@@ -94,7 +85,6 @@ class Settings(BaseSettings):
     # --------------------------------------------------
     # 3. CORS
     # --------------------------------------------------
-    # Renamed CORS_ALLOWED_ORIGINS -> BACKEND_CORS_ORIGINS to match main.py
     BACKEND_CORS_ORIGINS: List[AnyHttpUrl] = []
 
     @field_validator("BACKEND_CORS_ORIGINS", mode="before")
@@ -119,6 +109,10 @@ class Settings(BaseSettings):
     SUPABASE_URL: Optional[str] = None
     SUPABASE_SERVICE_ROLE_KEY: Optional[str] = None
     SUPABASE_ANON_KEY: Optional[str] = None
+    
+    # --- ADDED: Missing Auth Fields ---
+    SUPABASE_JWT_SECRET: Optional[str] = None
+    SUPABASE_JWT_ISSUER: Optional[str] = None 
 
     # --------------------------------------------------
     # 6. Storage
@@ -126,10 +120,7 @@ class Settings(BaseSettings):
     SCREENSHOT_BUCKET: str = "trade-screenshots"
     MAX_UPLOAD_SIZE_BYTES: int = 5 * 1024 * 1024
     ALLOWED_IMAGE_TYPES: List[str] = [
-        "image/png",
-        "image/jpeg",
-        "image/jpg",
-        "image/webp",
+        "image/png", "image/jpeg", "image/jpg", "image/webp",
     ]
 
     # --------------------------------------------------
@@ -148,7 +139,6 @@ class Settings(BaseSettings):
 
     LLM_PROVIDER: Literal["openai", "gemini", "perplexity"] = "gemini"
     LLM_MODEL: str = "gemini-1.5-flash"
-
     SANITIZE_PII: bool = True
 
     # --------------------------------------------------
@@ -163,7 +153,6 @@ class Settings(BaseSettings):
     # 10. Plans & Monetization (CONSTANTS)
     # --------------------------------------------------
     DEFAULT_PLAN: str = "FREE"
-
     PLAN_ORDER: ClassVar[List[str]] = ["FREE", "PRO", "PREMIUM"]
 
     PLAN_DEFINITIONS: ClassVar[Dict[str, Dict[str, Any]]] = {
@@ -244,22 +233,28 @@ class Settings(BaseSettings):
     # 12. Final Hard Validation (Fail Fast)
     # --------------------------------------------------
     def model_post_init(self, __context: Any) -> None:
+        """Fail fast if critical config is missing."""
+        
+        # 1. Log Level Check
         if self.LOG_LEVEL not in self.VALID_LOG_LEVELS:
             sys.exit(f"❌ Invalid LOG_LEVEL: {self.LOG_LEVEL}")
 
+        # 2. Auto-fill SUPABASE_JWT_SECRET if missing
+        if not self.SUPABASE_JWT_SECRET and self.SECRET_KEY:
+            self.SUPABASE_JWT_SECRET = self.SECRET_KEY
+            
+        # 3. Production Checks
         if self.IS_PROD:
             if not self.SECRET_KEY:
                 sys.exit("❌ FATAL: SECRET_KEY missing in production")
-
             if not self.DATABASE_DSN:
                 sys.exit("❌ FATAL: DATABASE_DSN missing in production")
-
+            if not self.SUPABASE_JWT_SECRET:
+                 sys.exit("❌ FATAL: SUPABASE_JWT_SECRET (or SECRET_KEY) required for Auth")
             if self.LLM_PROVIDER == "openai" and not self.OPENAI_API_KEY:
                 sys.exit("❌ FATAL: OPENAI_API_KEY required for OpenAI provider")
-
             if self.LLM_PROVIDER == "gemini" and not self.GEMINI_API_KEY:
                 sys.exit("❌ FATAL: GEMINI_API_KEY required for Gemini provider")
-
             if self.LLM_PROVIDER == "perplexity" and not self.PERPLEXITY_API_KEY:
                 sys.exit("❌ FATAL: PERPLEXITY_API_KEY required for Perplexity provider")
 

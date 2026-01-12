@@ -1,4 +1,3 @@
-# backend/app/apis/v1/chat/router.py
 import logging
 import asyncio
 from typing import Dict, Any, List, Optional
@@ -8,7 +7,7 @@ from starlette.concurrency import run_in_threadpool
 from supabase import Client
 
 from app.auth.dependency import get_current_user
-from app.auth.permissions import check_ai_quota
+from app.auth.permissions import validate_ai_usage_limits
 from app.services.quota_manager import QuotaManager
 from app.services.chat_pipeline import ChatPipeline
 from app.lib.data_sanitizer import sanitizer
@@ -30,7 +29,7 @@ router = APIRouter()
 # Helpers
 # ---------------------------------------------------------------------
 def extract_user_id(user: Dict[str, Any]) -> str:
-    uid = user.get("id") or user.get("sub")
+    uid = user.get("id") or user.get("sub") or user.get("user_id")
     if not uid:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return str(uid)
@@ -39,6 +38,23 @@ def extract_user_id(user: Dict[str, Any]) -> str:
 async def supabase_exec(fn):
     """Run blocking Supabase SDK calls safely."""
     return await run_in_threadpool(fn)
+
+
+async def _record_usage_background(user_id: str, profile: Dict[str, Any], tokens: int):
+    """
+    Updates usage stats in the background without blocking the response.
+    """
+    try:
+        # 1. Increment Chat Count
+        await QuotaManager.increment_daily_chat(user_id, profile)
+        
+        # 2. Record Token Usage (Lazy reservation)
+        # Note: If they hit the limit exactly during this generation, this might fail,
+        # but that's acceptable for post-generation accounting.
+        await QuotaManager.reserve_ai_tokens(user_id, profile, tokens)
+    except Exception as e:
+        # Log but don't crash the request
+        logger.error(f"Background usage update failed for user {user_id}: {e}")
 
 
 # ---------------------------------------------------------------------
@@ -115,7 +131,8 @@ async def get_session_messages(
 @router.post("", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
-    user_profile: Dict[str, Any] = Depends(check_ai_quota),
+    # FIX: Use the correct permission dependency we defined in permissions.py
+    user_profile: Dict[str, Any] = Depends(validate_ai_usage_limits),
     supabase: Client = Depends(get_authenticated_client),
 ):
     user_id = extract_user_id(user_profile)
@@ -182,7 +199,7 @@ async def chat(
         response_text = await ChatPipeline.process(user_id, message, history)
     except Exception:
         logger.exception("Chat pipeline failure")
-        response_text = "Something went wrong. Please try again."
+        response_text = "I encountered an error processing your request. Please try again."
 
     sanitized_response = sanitizer.sanitize(response_text)
 
@@ -201,18 +218,15 @@ async def chat(
     # -------------------------------------------------
     # F. Usage tracking (async, non-blocking)
     # -------------------------------------------------
+    # FIX: Calculate tokens and update using the correct QuotaManager methods
     est_tokens = max(1, int((len(message) + len(response_text)) / 4))
 
     asyncio.create_task(
-        QuotaManager.increment_usage(
-            user_id=user_id,
-            metric_type="chat_message",
-            extra_data={"tokens": est_tokens}
-        )
+        _record_usage_background(user_id, user_profile, est_tokens)
     )
 
     return {
         "response": response_text,
         "session_id": session_id,
-        "usage": ChatUsage(total_tokens=est_tokens),
+        "usage": ChatUsage(total_tokens=est_tokens, prompt_tokens=0, completion_tokens=0),
     }

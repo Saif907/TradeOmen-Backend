@@ -1,10 +1,8 @@
-# backend/app/core/database.py
-
 import asyncpg
 import logging
 import ssl
 from contextlib import asynccontextmanager
-from typing import Optional, Any
+from typing import Optional, Any, List
 
 from tenacity import retry, stop_after_attempt, wait_fixed
 from supabase import create_client, Client
@@ -21,9 +19,8 @@ class DatabaseConnectionError(RuntimeError):
 class Database:
     """
     Industry-grade database manager.
-
-    - asyncpg pool for high-performance queries (RLS BYPASS)
-    - Supabase SDK for auth, storage, realtime
+    - asyncpg pool for high-performance queries.
+    - Includes fetch_val helper to prevent 500 errors in trades API.
     """
 
     def __init__(self):
@@ -50,14 +47,12 @@ class Database:
         logger.info("Initializing PostgreSQL connection pool")
 
         try:
-            # FIX: Create a custom SSL context that ignores certificate errors.
-            # This is necessary for many cloud DBs (Supabase/Render) when connecting
-            # from local environments or containers without root cert access.
+            # FIX: Custom SSL context for cloud DBs (Supabase/Render)
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
 
-            # Supabase transactional pooler (port 6543) doesn't support prepared statements
+            # Supabase transaction pooler (port 6543) requires statement_cache_size=0
             statement_cache_size = (
                 0 if ":6543" in settings.DATABASE_DSN else 100
             )
@@ -68,7 +63,7 @@ class Database:
                 max_size=settings.MAX_CONNECTION_POOL_SIZE,
                 command_timeout=30,
                 statement_cache_size=statement_cache_size,
-                ssl=ssl_context,  # Apply the fix here
+                ssl=ssl_context,
             )
 
             async with self.pool.acquire() as conn:
@@ -90,17 +85,13 @@ class Database:
     def is_connected(self) -> bool:
         return self.pool is not None and not self.pool._closed
 
-    # -------------------------------------------------------------------------
-    # Safety Guard
-    # -------------------------------------------------------------------------
-
     def _require_pool(self) -> asyncpg.Pool:
         if not self.pool:
             raise DatabaseConnectionError("Database not connected")
         return self.pool
 
     # -------------------------------------------------------------------------
-    # Query Helpers (RLS BYPASS — CALLERS MUST FILTER BY user_id)
+    # Query Helpers (CRITICAL: fetch_val added)
     # -------------------------------------------------------------------------
 
     async def fetch_one(self, query: str, *args) -> Optional[asyncpg.Record]:
@@ -108,7 +99,16 @@ class Database:
         async with pool.acquire() as conn:
             return await conn.fetchrow(query, *args)
 
-    async def fetch_all(self, query: str, *args) -> list[asyncpg.Record]:
+    async def fetch_val(self, query: str, *args) -> Any:
+        """
+        Returns a single value (e.g., SELECT COUNT(*) FROM...).
+        Required by trades.py pagination logic.
+        """
+        pool = self._require_pool()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(query, *args)
+
+    async def fetch_all(self, query: str, *args) -> List[asyncpg.Record]:
         pool = self._require_pool()
         async with pool.acquire() as conn:
             return await conn.fetch(query, *args)
@@ -119,7 +119,7 @@ class Database:
             return await conn.execute(query, *args)
 
     # -------------------------------------------------------------------------
-    # Transactions (CRITICAL FOR FINANCIAL DATA)
+    # Transactions
     # -------------------------------------------------------------------------
 
     @asynccontextmanager

@@ -1,216 +1,230 @@
-# backend/app/apis/v1/strategies.py
-
 import logging
-import time
-from typing import List, Dict, Any
-from datetime import datetime, timezone
+import json
+import uuid
+from datetime import datetime
+from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from supabase import create_client, Client
 
 from app.core.config import settings
+from app.core.database import db
 from app.auth.dependency import get_current_user
 
-# ✅ IMPORT CENTRALIZED SCHEMAS
-from app.schemas import (
-    StrategyCreate, 
-    StrategyUpdate, 
-    StrategyResponse, 
-    PlanTier
+# Ensure these schemas exist in app/schemas/strategy_schemas.py
+from app.schemas.strategy_schemas import (
+    StrategyCreate,
+    StrategyUpdate,
+    StrategyResponse
 )
 
+logger = logging.getLogger("tradeomen.strategies")
 router = APIRouter()
-security = HTTPBearer()
-logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------
-# Services (Local Helpers)
+# Helpers
 # ---------------------------------------------------------------------
 
-class PlanService:
+def _get_user_id(user: Dict[str, Any]) -> str:
+    return user["user_id"]
+
+
+def _serialize_row(row: Any) -> Dict[str, Any]:
     """
-    Handles Latency/Caching for User Plans.
-    Identical to the service in trades.py to maintain consistency.
+    Converts database types (UUID, datetime, arrays) into Pydantic-friendly formats.
     """
-    _PLAN_CACHE: Dict[str, Dict[str, Any]] = {}
-    CACHE_TTL = 60 
+    if not row:
+        return {}
+    
+    d = dict(row)
+    
+    for k, v in d.items():
+        if isinstance(v, uuid.UUID):
+            d[k] = str(v)
+        elif isinstance(v, datetime):
+            d[k] = v.isoformat()
+            
+    # Handle JSON fields
+    if "rules" in d:
+        if isinstance(d["rules"], str):
+            try:
+                d["rules"] = json.loads(d["rules"])
+            except:
+                d["rules"] = {}
+        elif d["rules"] is None:
+            d["rules"] = {}
 
-    @classmethod
-    def get_user_plan(cls, user_id: str, supabase: Client) -> str:
-        now = time.time()
-        
-        # 1. Check Cache
-        cached = cls._PLAN_CACHE.get(user_id)
-        if cached and cached["expires_at"] > now:
-            return cached["plan"]
+    # Handle Arrays (instrument_types is typically TEXT[] in Postgres)
+    if "instrument_types" in d and d["instrument_types"] is None:
+        d["instrument_types"] = []
 
-        # 2. DB Fetch
-        try:
-            # Matches 'user_profiles' table used in trades.py
-            res = supabase.table("user_profiles").select("plan_tier").eq("id", user_id).single().execute()
-            real_plan = (res.data.get("plan_tier") or "FREE").upper()
-        except Exception as e:
-            logger.error(f"Plan fetch failed for {user_id}: {e}")
-            real_plan = "FREE"
+    return d
 
-        # 3. Update Cache
-        cls._PLAN_CACHE[user_id] = {
-            "plan": real_plan,
-            "expires_at": now + cls.CACHE_TTL
-        }
-        return real_plan
 
-# ---------------------------------------------------------------------
-# Dependencies
-# ---------------------------------------------------------------------
-
-def get_authenticated_client(creds: HTTPAuthorizationCredentials = Depends(security)) -> Client:
+async def _check_strategy_quota(user_id: str, plan_tier: str):
     """
-    Initializes Supabase Client with ANON key.
-    The .auth() call elevates permissions to the specific user's level via RLS.
+    Enforce strategy count limits using fast SQL.
     """
-    token = creds.credentials
-    # ✅ SECURITY: Use ANON_KEY to respect RLS policies
-    client = create_client(settings.SUPABASE_URL, settings.SUPABASE_ANON_KEY)
-    client.postgrest.auth(token)
-    return client
+    if plan_tier == "PREMIUM":
+        return
+
+    limits = settings.get_plan_limits(plan_tier)
+    # "max_strategies" key comes from config.py PLAN_DEFINITIONS
+    max_count = limits.get("max_strategies")
+
+    if max_count is None: # Unlimited
+        return
+
+    query = "SELECT COUNT(*) FROM strategies WHERE user_id = $1"
+    count = await db.fetch_val(query, user_id)
+    
+    if count >= max_count:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Strategy limit reached ({max_count}) for {plan_tier} plan."
+        )
+
 
 # ---------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------
 
-@router.post("/", response_model=StrategyResponse, status_code=status.HTTP_201_CREATED)
-def create_strategy(
-    strategy: StrategyCreate,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
-):
-    user_id = current_user["sub"]
-    
-    # 1. Fetch User Plan
-    user_plan = PlanService.get_user_plan(user_id, supabase)
-    
-    # 2. Get Limits from Central Config
-    # Default to FREE limits if plan not found in config
-    plan_limits = settings.PLAN_LIMITS.get(user_plan, settings.PLAN_LIMITS["FREE"])
-    max_strategies = plan_limits.get("strategies", 1)
-
-    # 3. Check Current Count
-    # We use count='exact', head=True to get the number without fetching data rows (Performance)
-    res = supabase.table("strategies") \
-        .select("id", count="exact", head=True) \
-        .eq("user_id", user_id) \
-        .execute()
-    
-    current_count = getattr(res, "count", 0) or 0
-
-    # 4. Enforce Quota
-    if current_count >= max_strategies:
-        raise HTTPException(
-            status_code=status.HTTP_402_PAYMENT_REQUIRED,
-            detail=f"Strategy limit reached ({current_count}/{max_strategies}). Upgrade to add more."
-        )
-
-    # 5. Prepare Data
-    data = strategy.model_dump()
-    data["user_id"] = user_id
-    # Explicit UTC to prevent Postgres timezone issues
-    data["created_at"] = datetime.now(timezone.utc).isoformat()
-    
-    # -----------------------------------------------------------
-    # TODO: AI Embeddings Hook
-    # embedding = generate_embedding(f"{data['name']} {data.get('description')}")
-    # data['embedding'] = embedding
-    # -----------------------------------------------------------
-
-    try:
-        response = supabase.table("strategies").insert(data).execute()
-        if not response.data:
-            raise HTTPException(status_code=400, detail="Failed to create strategy")
-        return response.data[0]
-    except Exception as e:
-        logger.error(f"DB Error creating strategy: {e}")
-        raise HTTPException(status_code=400, detail=f"Database Error: {str(e)}")
-
-
 @router.get("/", response_model=List[StrategyResponse])
-def get_strategies(
+async def get_strategies(
     current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
 ):
-    user_id = current_user["sub"]
-    try:
-        # Fetch strategies for user, newest first
-        response = supabase.table("strategies")\
-            .select("*")\
-            .eq("user_id", user_id)\
-            .order("created_at", desc=True)\
-            .execute()
-            
-        return response.data
-    except Exception as e:
-        logger.error(f"Error fetching strategies: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch strategies")
+    user_id = _get_user_id(current_user)
+    
+    query = """
+        SELECT * FROM strategies 
+        WHERE user_id = $1 
+        ORDER BY created_at DESC
+    """
+    rows = await db.fetch_all(query, user_id)
+    
+    return [_serialize_row(row) for row in rows]
 
 
 @router.get("/{strategy_id}", response_model=StrategyResponse)
-def get_strategy(
+async def get_strategy(
     strategy_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
 ):
+    user_id = _get_user_id(current_user)
+    
+    query = "SELECT * FROM strategies WHERE id = $1 AND user_id = $2"
+    row = await db.fetch_one(query, strategy_id, user_id)
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+        
+    return _serialize_row(row)
+
+
+@router.post("/", response_model=StrategyResponse, status_code=status.HTTP_201_CREATED)
+async def create_strategy(
+    strategy: StrategyCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user_id = _get_user_id(current_user)
+    
+    # 1. Enforce Quota
+    await _check_strategy_quota(user_id, current_user.get("plan_tier", "FREE"))
+
+    # 2. Prepare Data
+    data = strategy.model_dump()
+    
+    # Serialize rules to JSON string for jsonb column
+    rules_json = json.dumps(data.get("rules", {}))
+    
+    # Note: 'instrument_types' is passed as a list; asyncpg handles TEXT[] conversion automatically.
+    
+    query = """
+        INSERT INTO strategies (
+            user_id, name, description, emoji, color_hex, style, 
+            instrument_types, rules, track_missed_trades, created_at
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW()
+        )
+        RETURNING *
+    """
+    
     try:
-        response = supabase.table("strategies").select("*").eq("id", strategy_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Strategy not found")
-        return response.data[0]
-    except HTTPException:
-        raise
+        row = await db.fetch_one(
+            query,
+            user_id,
+            data["name"],
+            data.get("description"),
+            data.get("emoji", "♟️"),
+            data.get("color_hex", "#FFFFFF"),
+            data.get("style"),
+            data.get("instrument_types", []),
+            rules_json,
+            data.get("track_missed_trades", False)
+        )
     except Exception as e:
-        logger.error(f"Error fetching strategy {strategy_id}: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"Strategy creation failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to create strategy")
+
+    return _serialize_row(row)
 
 
 @router.patch("/{strategy_id}", response_model=StrategyResponse)
-def update_strategy(
+async def update_strategy(
     strategy_id: str,
     strategy: StrategyUpdate,
     current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
 ):
-    # exclude_unset=True ensures we only send fields the user actually changed
-    update_data = strategy.model_dump(exclude_unset=True)
+    user_id = _get_user_id(current_user)
     
+    # 1. Filter update data
+    update_data = strategy.model_dump(exclude_unset=True)
     if not update_data:
         raise HTTPException(status_code=400, detail="No fields to update")
 
-    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
-
-    try:
-        response = supabase.table("strategies").update(update_data).eq("id", strategy_id).execute()
-        if not response.data:
-            raise HTTPException(status_code=404, detail="Strategy not found or not authorized")
-        return response.data[0]
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error updating strategy {strategy_id}: {e}")
-        raise HTTPException(status_code=500, detail="Update failed")
+    # 2. Build Dynamic Query
+    set_clauses = []
+    values = []
+    idx = 1
+    
+    for key, val in update_data.items():
+        if key == "rules":
+            set_clauses.append(f"{key} = ${idx}::jsonb")
+            values.append(json.dumps(val))
+        else:
+            set_clauses.append(f"{key} = ${idx}")
+            values.append(val)
+        idx += 1
+    
+    # Add ID parameters for WHERE clause
+    values.append(strategy_id)
+    values.append(user_id)
+    
+    query = f"""
+        UPDATE strategies
+        SET {", ".join(set_clauses)}
+        WHERE id = ${idx} AND user_id = ${idx + 1}
+        RETURNING *
+    """
+    
+    row = await db.fetch_one(query, *values)
+    if not row:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+        
+    return _serialize_row(row)
 
 
 @router.delete("/{strategy_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_strategy(
+async def delete_strategy(
     strategy_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
-    supabase: Client = Depends(get_authenticated_client)
 ):
-    try:
-        # RLS will ensure user can only delete their own
-        # We assume ON DELETE CASCADE is set on the 'trades' foreign key in DB
-        # If not, you might need to check for existing trades before deleting.
-        response = supabase.table("strategies").delete().eq("id", strategy_id).execute()
-        return None
-    except Exception as e:
-        logger.error(f"Error deleting strategy {strategy_id}: {e}")
-        raise HTTPException(status_code=500, detail="Deletion failed")
+    user_id = _get_user_id(current_user)
+    
+    # Using RETURNING id allows us to verify if anything was actually deleted
+    query = "DELETE FROM strategies WHERE id = $1 AND user_id = $2 RETURNING id"
+    row = await db.fetch_one(query, strategy_id, user_id)
+    
+    if not row:
+        # Optional: Check if it existed but belonged to someone else for 403 vs 404
+        raise HTTPException(status_code=404, detail="Strategy not found")
