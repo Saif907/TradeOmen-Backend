@@ -33,7 +33,6 @@ from app.schemas.trade_schemas import (
     TradeCreate,
     TradeUpdate,
     TradeResponse,
-    PaginatedTradesResponse,
 )
 
 logger = logging.getLogger("tradeomen.trades")
@@ -57,7 +56,7 @@ def _get_user_id(user: Dict[str, Any]) -> str:
 def _serialize_row(row: Any) -> Dict[str, Any]:
     """
     Robustly converts database types to JSON-compatible types for Pydantic.
-    Maps DB columns (encrypted_*) to API fields.
+    Maps DB columns (encrypted_*) to API fields for detailed views.
     """
     if not row:
         return {}
@@ -80,7 +79,6 @@ def _serialize_row(row: Any) -> Dict[str, Any]:
 
     # ✅ Handle Screenshots: Map 'encrypted_screenshots' -> 'screenshots'
     # The DB stores a JSON array of ENCRYPTED strings. 
-    # We pass them raw here; ScreenshotService will handle decryption for URLs.
     screenshot_source = d.get("encrypted_screenshots") or d.get("screenshots")
     
     if screenshot_source:
@@ -97,7 +95,6 @@ def _serialize_row(row: Any) -> Dict[str, Any]:
         d["screenshots"] = []
     
     # ✅ Handle Notes: Map 'encrypted_notes' -> 'notes'
-    # DB stores plain text in 'encrypted_notes' based on user sample.
     if "encrypted_notes" in d:
         d["notes"] = d["encrypted_notes"]
 
@@ -128,7 +125,6 @@ class ScreenshotService:
     def try_decrypt(path: str) -> str:
         """Attempt to decrypt a path. If it fails or isn't encrypted, return as is."""
         try:
-            # If path looks like Fernet token (starts with gAAAA), decrypt it
             if path.startswith("gAAAA"):
                 decrypted = crypto.decrypt(path)
                 return decrypted if decrypted else path
@@ -142,8 +138,6 @@ class ScreenshotService:
         real_path = ScreenshotService.try_decrypt(path)
         
         try:
-            # Note: Bucket name is hardcoded to 'trade_screenshots' based on user input, 
-            # or uses settings if configured.
             bucket = getattr(settings, "SCREENSHOT_BUCKET", "trade_screenshots")
             
             res = supabase_storage.storage.from_(bucket).create_signed_url(real_path, 3600)
@@ -164,8 +158,6 @@ class ScreenshotService:
         except:
             paths = [str(paths_json)]
 
-        # Process each path: Decrypt it for the URL, but keep original for the 'path' field
-        # so frontend sends back the correct encrypted ID if it needs to update it.
         results = []
         for p in paths:
             if not p or "Decryption Error" in p: continue
@@ -173,8 +165,7 @@ class ScreenshotService:
             # The URL needs the DECRYPTED path
             url = ScreenshotService.sign_url(p)
             
-            # We return the original (potentially encrypted) path so updates work correctly,
-            # and the signed URL for display.
+            # We return the original (potentially encrypted) path so updates work correctly
             results.append({"path": p, "url": url})
             
         return results
@@ -184,61 +175,26 @@ class ScreenshotService:
 # Endpoints
 # ---------------------------------------------------------------------
 
-@router.get("/", response_model=PaginatedTradesResponse)
-async def get_trades(
-    page: int = Query(1, ge=1),
-    limit: int = Query(35, ge=1, le=100),
-    current_user: Dict[str, Any] = Depends(get_current_user),
-):
-    user_id = _get_user_id(current_user)
-    offset = (page - 1) * limit
-
-    # ✅ Explicitly selecting encrypted_notes and encrypted_screenshots
-    query = """
-        SELECT 
-            t.*,
-            s.name as strategy_name,
-            s.emoji as strategy_emoji
-        FROM trades t
-        LEFT JOIN strategies s ON t.strategy_id = s.id
-        WHERE t.user_id = $1
-        ORDER BY t.entry_time DESC
-        LIMIT $2 OFFSET $3
-    """
-    rows = await db.fetch_all(query, user_id, limit, offset)
-    
-    count_query = "SELECT COUNT(*) FROM trades WHERE user_id = $1"
-    total = await db.fetch_val(count_query, user_id)
-
-    data = []
-    for row in rows:
-        d = _serialize_row(row)
-        if d.get("strategy_name"):
-            d["strategies"] = {"name": d.pop("strategy_name"), "emoji": d.pop("strategy_emoji")}
-        else:
-            d["strategies"] = None
-        data.append(d)
-
-    return {"data": data, "total": total, "page": page, "size": limit}
-
+# NOTE: GET /trades/ (List) has been REMOVED to enforce frontend "Direct Read".
 
 @router.post("/", response_model=TradeResponse, status_code=201)
 async def create_trade(
     trade: TradeCreate,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    """
+    Create a new trade. Handles encryption, PnL calculation, and Quotas.
+    """
     user_id = _get_user_id(current_user)
     await _check_trade_quota(user_id, current_user.get("plan_tier", "FREE"))
 
-    # Notes are Plain Text (based on sample)
+    # Notes are Plain Text (based on sample) but mapped to encrypted_notes col
     notes = sanitizer.sanitize(trade.notes) if trade.notes else None
     
-    # Screenshots are Encrypted (based on sample)
-    # We encrypt each path before storing
+    # Screenshots are Encrypted
     screenshots_data = []
     if trade.screenshots:
         for s in trade.screenshots:
-            # If it's already encrypted (starts with gAAAA), keep it. Else encrypt it.
             if s.startswith("gAAAA"):
                 screenshots_data.append(s)
             else:
@@ -246,14 +202,13 @@ async def create_trade(
                 
     screenshots_json = json.dumps(screenshots_data)
 
-    # Calculate PnL
+    # Calculate PnL Once
     pnl = trade.pnl
     if pnl is None and trade.exit_price and trade.quantity:
         diff = (trade.exit_price - trade.entry_price)
         pnl = (diff * trade.quantity) if trade.direction == "LONG" else (diff * -1 * trade.quantity)
         pnl -= (trade.fees or 0)
 
-    # ✅ Write to encrypted_* columns
     query = """
         INSERT INTO trades (
             user_id, symbol, instrument_type, direction, status,
@@ -289,6 +244,11 @@ async def get_trade(
     trade_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
+    """
+    Fetch a single trade by ID.
+    Used by the frontend to retrieve SENSITIVE data (notes/screenshots)
+    that are excluded from the main list query for security.
+    """
     user_id = _get_user_id(current_user)
     
     query = """
@@ -324,7 +284,7 @@ async def update_trade(
     update_data = payload.model_dump(exclude_unset=True)
     if not update_data: raise HTTPException(400, "No fields to update")
 
-    # ✅ Map API fields to DB Columns
+    # Handle encryption for updates
     if "notes" in update_data:
         update_data["encrypted_notes"] = sanitizer.sanitize(update_data.pop("notes"))
     
@@ -381,6 +341,44 @@ async def delete_trade(
         raise HTTPException(404, "Trade not found")
 
 
+@router.get("/export/csv")
+async def export_trades(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    PRO Feature: Export trades to CSV.
+    Uses backend read to bypass frontend limits and ensure plan compliance.
+    """
+    user_id = _get_user_id(current_user)
+    plan = current_user.get("plan_tier", "FREE")
+    
+    if plan not in ["PRO", "PREMIUM"]:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Export is a PRO feature.")
+
+    # Optimized read for CSV
+    query = """
+        SELECT symbol, instrument_type, direction, entry_price, exit_price, quantity, pnl, entry_time
+        FROM trades WHERE user_id = $1 ORDER BY entry_time DESC
+    """
+    rows = await db.fetch_all(query, user_id)
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Symbol", "Type", "Side", "Entry Price", "Exit Price", "Qty", "PnL", "Date"])
+    
+    for row in rows:
+        writer.writerow([
+            row["symbol"], row["instrument_type"], row["direction"],
+            row["entry_price"], row["exit_price"], row["quantity"],
+            row["pnl"], row["entry_time"]
+        ])
+    
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=trades_export.csv"}
+    )
+
+
 @router.post("/uploads/trade-screenshots", status_code=201)
 async def upload_trade_screenshot(
     request: Request,
@@ -411,13 +409,9 @@ async def upload_trade_screenshot(
                 )
             await run_in_threadpool(_upload)
             
-            # Return Encrypted path + Signed URL
-            # Note: The 'path' returned to frontend must be usable for subsequent updates.
-            # If we return the raw path, the frontend sends it back, and update_trade encrypts it.
-            # If we return encrypted path, frontend sends it back, update_trade sees gAAAA and keeps it.
-            # Returning the RAW path is safer for display, but we must handle it.
-            # Here, we return the raw path for the immediate response.
-            signed = ScreenshotService.sign_url(path) # This handles raw path signing too
+            # Return encrypted path logic handled by frontend, we just return the raw path for now
+            # and let the frontend send it back to update_trade which handles encryption.
+            signed = ScreenshotService.sign_url(path)
             uploaded_results.append({"filename": file.filename, "path": path, "url": signed})
             new_paths.append(path)
         except Exception as e:
@@ -425,6 +419,7 @@ async def upload_trade_screenshot(
 
     if not uploaded_results: raise HTTPException(400, "No valid files uploaded")
 
+    # If trade_id is provided, link immediately (Atomic update)
     trade_id = request.query_params.get("trade_id")
     uploaded_to_trade = False
 
@@ -444,7 +439,7 @@ async def upload_trade_screenshot(
                     except:
                         pass
                 
-                # Encrypt new paths before saving to DB
+                # Encrypt paths before DB save
                 encrypted_new_paths = [crypto.encrypt(p) for p in new_paths]
                 final_paths = current_paths + encrypted_new_paths
                 
