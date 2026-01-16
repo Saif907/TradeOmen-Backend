@@ -56,24 +56,20 @@ class QuotaManager:
         return settings.get_plan_limits(plan)
 
     # --------------------------------------------------------------
-    # Feature Flags (Updated to Async for DB Fallback)
+    # Feature Flags (Async for DB Fallback)
     # --------------------------------------------------------------
 
     @staticmethod
     async def require_feature(user_profile: Dict[str, Any], flag: str) -> None:
         """
-        Checks if a feature is allowed.
-        Falls back to DB lookup if the profile dict seems stale (FREE).
+        Checks if a feature is allowed based on configuration limits.
+        Falls back to DB lookup if the profile dict seems stale.
         """
         # 1. Check using the passed profile object first (Fast)
         plan = QuotaManager._plan(user_profile)
-        
-        if plan == "PREMIUM":
-            return
-
         plan_limits = QuotaManager.limits(plan)
         
-        # 2. If allowed by object, return immediately
+        # 2. If explicitly allowed by config, return immediately
         if plan_limits.get(flag, False):
             return
 
@@ -93,10 +89,8 @@ class QuotaManager:
                 if row:
                     # Re-evaluate with DB data
                     db_plan = QuotaManager._plan(dict(row))
-                    if db_plan == "PREMIUM":
-                        return
-                    
                     db_limits = QuotaManager.limits(db_plan)
+                    
                     if db_limits.get(flag, False):
                         return
                     
@@ -125,13 +119,9 @@ class QuotaManager:
             raise QuotaExceededError("Request too large")
 
         plan = QuotaManager._plan(user_profile)
-        
-        # Double check DB if plan seems low but user might be premium? 
-        # (Optional optimization, but strictly speaking reserve_ai_tokens relies on caller consistency)
-        if plan == "PREMIUM":
-            return
-
         limits = QuotaManager.limits(plan)
+        
+        # Robustness: Rely on config. If limit is None, it is unlimited.
         token_limit = limits.get("monthly_ai_tokens_limit")
 
         if token_limit is None:

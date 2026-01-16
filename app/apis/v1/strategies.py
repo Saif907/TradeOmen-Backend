@@ -65,9 +65,7 @@ async def _check_strategy_quota(user_id: str, plan_tier: str):
     """
     Enforce strategy count limits using fast SQL.
     """
-    if plan_tier == "PREMIUM":
-        return
-
+    # Robust: Rely on config limits. If limit is None, it is unlimited.
     limits = settings.get_plan_limits(plan_tier)
     # "max_strategies" key comes from config.py PLAN_DEFINITIONS
     max_count = limits.get("max_strategies")

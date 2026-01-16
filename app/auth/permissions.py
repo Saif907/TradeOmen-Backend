@@ -1,3 +1,5 @@
+# backend/app/auth/permissions.py
+
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Any
@@ -124,15 +126,13 @@ async def validate_ai_usage_limits(
     
     # 2. Get Plan Limits
     plan = QuotaManager._plan(profile)
-    
-    # Optimization: Premium users bypass checks (save CPU)
-    if plan == "PREMIUM":
-        return profile
-        
     limits = QuotaManager.limits(plan)
 
-    # 3. Check Daily Chat Limit (with Logic Fix)
+    # 3. Check Daily Chat Limit
+    # Note: If limit is None, it's unlimited (e.g. some internal tier).
+    # If PREMIUM has a number (e.g. 200), this logic will now correctly enforce it.
     chat_limit = limits.get("daily_chat_msgs")
+    
     if chat_limit is not None:
         effective_usage = _get_effective_chat_usage(profile)
         if effective_usage >= chat_limit:
@@ -194,22 +194,18 @@ async def check_import_quota(
     profile = await _load_fresh_profile(user_id)
     plan = QuotaManager._plan(profile)
     
-    if plan == "PREMIUM":
-        return profile
-
+    # Robust check: rely on limits, not plan name
     limits = QuotaManager.limits(plan)
     limit = limits.get("monthly_csv_imports")
     
     if limit is not None:
-        # Check simple monthly reset logic
-        # Note: If you want lazy reset logic here too, replicate _get_effective_token_usage logic
-        # Assuming simple check for now:
         reset_at = profile.get("quota_reset_at")
         now = datetime.now(timezone.utc)
         
         # Calculate effective usage
         effective_usage = profile.get("monthly_import_count", 0)
         
+        # Simple monthly reset logic for imports
         if reset_at and (now.year > reset_at.year or now.month > reset_at.month):
             effective_usage = 0
             
