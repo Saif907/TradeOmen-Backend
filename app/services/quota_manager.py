@@ -13,7 +13,7 @@ MAX_TOKENS_PER_REQUEST = 10_000
 
 
 # ------------------------------------------------------------------
-# Domain Errors (DO NOT USE HTTPException HERE)
+# Domain Errors
 # ------------------------------------------------------------------
 
 class QuotaError(Exception):
@@ -37,27 +37,81 @@ class QuotaManager:
 
     @staticmethod
     def _plan(user_profile: Dict[str, Any]) -> str:
-        return (user_profile.get("plan_tier") or settings.DEFAULT_PLAN).upper()
+        # 1. Extract plan from profile
+        raw_plan = (
+            user_profile.get("plan_tier") or 
+            user_profile.get("active_plan_id") or 
+            user_profile.get("plan") or 
+            settings.DEFAULT_PLAN
+        ).upper()
+        
+        # 2. Normalize Legacy/Alias plans
+        if raw_plan in ("FOUNDER", "LIFETIME", "LIFETIME_PRO"):
+            return "PREMIUM"
+            
+        return raw_plan
 
     @staticmethod
     def limits(plan: str) -> Dict[str, Any]:
         return settings.get_plan_limits(plan)
 
     # --------------------------------------------------------------
-    # Feature Flags
+    # Feature Flags (Updated to Async for DB Fallback)
     # --------------------------------------------------------------
 
     @staticmethod
-    def require_feature(user_profile: Dict[str, Any], flag: str) -> None:
+    async def require_feature(user_profile: Dict[str, Any], flag: str) -> None:
+        """
+        Checks if a feature is allowed.
+        Falls back to DB lookup if the profile dict seems stale (FREE).
+        """
+        # 1. Check using the passed profile object first (Fast)
         plan = QuotaManager._plan(user_profile)
+        
         if plan == "PREMIUM":
             return
 
-        if not QuotaManager.limits(plan).get(flag, False):
-            raise FeatureLockedError(flag)
+        plan_limits = QuotaManager.limits(plan)
+        
+        # 2. If allowed by object, return immediately
+        if plan_limits.get(flag, False):
+            return
+
+        # 3. If denied/missing, try fetching fresh from DB (Source of Truth)
+        #    This handles cases where 'current_user' is a stale JWT payload.
+        user_id = user_profile.get("user_id") or user_profile.get("id")
+        
+        if user_id:
+            try:
+                # Fetch only the plan fields
+                row = await db.fetch_one("""
+                    SELECT plan_tier, active_plan_id 
+                    FROM public.user_profiles 
+                    WHERE id = $1
+                """, user_id)
+                
+                if row:
+                    # Re-evaluate with DB data
+                    db_plan = QuotaManager._plan(dict(row))
+                    if db_plan == "PREMIUM":
+                        return
+                    
+                    db_limits = QuotaManager.limits(db_plan)
+                    if db_limits.get(flag, False):
+                        return
+                    
+                    # Update variable for logging
+                    plan = db_plan 
+
+            except Exception as e:
+                logger.warning(f"Failed to fetch fresh plan for feature check: {e}")
+
+        # 4. If still denied, raise error
+        logger.warning(f"Feature locked: {flag} for plan {plan} (User ID: {user_id})")
+        raise FeatureLockedError(flag)
 
     # --------------------------------------------------------------
-    # AI TOKEN RESERVATION (SOURCE OF TRUTH)
+    # AI TOKEN RESERVATION
     # --------------------------------------------------------------
 
     @staticmethod
@@ -71,6 +125,9 @@ class QuotaManager:
             raise QuotaExceededError("Request too large")
 
         plan = QuotaManager._plan(user_profile)
+        
+        # Double check DB if plan seems low but user might be premium? 
+        # (Optional optimization, but strictly speaking reserve_ai_tokens relies on caller consistency)
         if plan == "PREMIUM":
             return
 
@@ -84,7 +141,6 @@ class QuotaManager:
 
         try:
             async with db.transaction() as conn:
-                # Lazy monthly reset
                 await conn.execute("""
                     UPDATE public.user_profiles
                     SET monthly_ai_tokens_used = 0,
@@ -96,7 +152,6 @@ class QuotaManager:
                       )
                 """, user_id, now)
 
-                # Atomic reservation
                 row = await conn.fetchrow("""
                     UPDATE public.user_profiles
                     SET monthly_ai_tokens_used = monthly_ai_tokens_used + $2
@@ -115,7 +170,7 @@ class QuotaManager:
             raise QuotaServiceUnavailable()
 
     # --------------------------------------------------------------
-    # DAILY MESSAGE COUNT (ATOMIC)
+    # COUNTERS
     # --------------------------------------------------------------
 
     @staticmethod
@@ -137,10 +192,6 @@ class QuotaManager:
             logger.exception("Failed to increment chat counter")
             raise QuotaServiceUnavailable()
 
-    # --------------------------------------------------------------
-    # CSV IMPORT
-    # --------------------------------------------------------------
-
     @staticmethod
     async def increment_csv_import(user_id: str) -> None:
         try:
@@ -160,15 +211,12 @@ class QuotaManager:
             logger.exception("CSV quota increment failed")
             raise QuotaServiceUnavailable()
 
-    # --------------------------------------------------------------
-    # READ-ONLY USAGE (FOR UI)
-    # --------------------------------------------------------------
-
     @staticmethod
     async def get_usage(user_id: str) -> Dict[str, Any]:
         try:
             row = await db.fetch_one("""
                 SELECT plan_tier,
+                       active_plan_id,
                        daily_chat_count,
                        monthly_import_count,
                        monthly_ai_tokens_used
@@ -181,21 +229,22 @@ class QuotaManager:
         if not row:
             return {}
 
-        plan = QuotaManager._plan(dict(row))
+        row_dict = dict(row)
+        plan = QuotaManager._plan(row_dict)
         limits = QuotaManager.limits(plan)
 
         return {
             "plan": plan,
             "chat": {
-                "used": row["daily_chat_count"],
+                "used": row_dict["daily_chat_count"],
                 "limit": limits.get("daily_chat_msgs"),
             },
             "imports": {
-                "used": row["monthly_import_count"],
+                "used": row_dict["monthly_import_count"],
                 "limit": limits.get("monthly_csv_imports"),
             },
             "ai_tokens": {
-                "used": row["monthly_ai_tokens_used"],
+                "used": row_dict["monthly_ai_tokens_used"],
                 "limit": limits.get("monthly_ai_tokens_limit"),
             },
         }

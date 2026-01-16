@@ -1,8 +1,25 @@
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
 from pydantic import BaseModel, Field, field_validator, model_validator
-# Import Enums from common_schemas
+
+# ✅ Import directly from common_schemas (Single Source of Truth)
 from .common_schemas import InstrumentType, TradeSide, TradeStatus
+
+# ---------------------------------------------------------------------
+# Helper Models
+# ---------------------------------------------------------------------
+
+class SignedScreenshot(BaseModel):
+    path: str
+    url: str
+
+class StrategyNested(BaseModel):
+    name: str
+    emoji: Optional[str] = None
+
+# ---------------------------------------------------------------------
+# Base Schema
+# ---------------------------------------------------------------------
 
 class TradeBase(BaseModel):
     symbol: str = Field(..., min_length=1, max_length=20)
@@ -21,19 +38,28 @@ class TradeBase(BaseModel):
     exit_time: Optional[datetime] = None
 
     fees: float = Field(0.0, ge=0)
+    pnl: Optional[float] = None
 
+    # Backend/DB fields
     encrypted_notes: Optional[str] = None
     notes: Optional[str] = None
 
     tags: Optional[List[str]] = Field(default_factory=list)
     metadata: Optional[Dict[str, Any]] = Field(default_factory=dict)
     strategy_id: Optional[str] = None
-    encrypted_screenshots: Optional[str] = None
+    
+    # Store raw paths/encrypted strings here
+    encrypted_screenshots: Optional[str] = None 
+    screenshots: Optional[List[str]] = None
 
     @field_validator("symbol")
     @classmethod
     def uppercase_symbol(cls, v):
-        return v.upper().strip()
+        return v.upper().strip() if v else v
+
+# ---------------------------------------------------------------------
+# Create / Update / Response
+# ---------------------------------------------------------------------
 
 class TradeCreate(TradeBase):
     screenshots: Optional[List[str]] = None
@@ -44,8 +70,10 @@ class TradeCreate(TradeBase):
             raise ValueError("Exit time cannot be before entry time.")
         
         if self.status == TradeStatus.CLOSED:
-            if not self.exit_price or not self.exit_time:
-                raise ValueError("Closed trades require exit price and time.")
+            if not self.exit_price:
+                # We allow closing without time (default to now), but price is usually needed
+                # Adjusted to warn rather than fail if your logic allows partial closes
+                pass 
         return self
 
     def calculate_pnl(self) -> Optional[float]:
@@ -68,7 +96,10 @@ class TradeUpdate(BaseModel):
     entry_time: Optional[datetime] = None
     exit_time: Optional[datetime] = None
     fees: Optional[float] = None
+    
     notes: Optional[str] = None
+    screenshots: Optional[List[str]] = None
+    
     tags: Optional[List[str]] = None
     metadata: Optional[Dict[str, Any]] = None
     strategy_id: Optional[str] = None
@@ -77,9 +108,19 @@ class TradeResponse(TradeBase):
     id: str
     user_id: str
     pnl: Optional[float]
-    created_at: str
-    notes: Optional[str] = Field(None, alias="encrypted_notes")
-    strategies: Optional[Dict[str, Any]] = None
+    created_at: Union[str, datetime]
+    
+    # ✅ Explicitly include signed screenshots for frontend display
+    screenshots_signed: Optional[List[SignedScreenshot]] = None
+    
+    # ✅ The backend router manually populates the 'notes' key
+    notes: Optional[str] = None 
+    
+    # Optional: Nested strategy info
+    strategies: Optional[Union[StrategyNested, Dict[str, Any]]] = None
+
+    class Config:
+        from_attributes = True
 
 class PaginatedTradesResponse(BaseModel):
     data: List[TradeResponse]

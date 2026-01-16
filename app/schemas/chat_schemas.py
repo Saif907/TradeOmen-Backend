@@ -7,6 +7,7 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = None
     model: str = "gemini-2.5-flash"
     provider: Optional[str] = 'gemini'  # Optional override
+    web_search: bool = False  # <--- ADDED to match frontend
 
 class ChatUsage(BaseModel):
     total_tokens: Optional[int] = 0
@@ -43,3 +44,20 @@ class MessageSchema(BaseModel):
     role: str
     content: str
     created_at: datetime
+
+class SessionUpdate(BaseModel):
+    topic: str
+
+class ImportConfirmSchema(BaseModel):
+    file_path: str
+    mapping: Dict[str, str]
+    session_id: Optional[str] = None
+
+class UploadResponse(BaseModel):
+    status: str
+    file_path: str
+    filename: str
+    detected_headers: List[str]
+    preview: List[Dict[str, Any]]
+    mapping: Dict[str, str]
+    message: str
