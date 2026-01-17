@@ -23,7 +23,8 @@ async def _load_fresh_profile(user_id: str) -> Dict[str, Any]:
     """
     query = """
         SELECT 
-            id, 
+            id,
+            active_plan_id, 
             plan_tier, 
             daily_chat_count, 
             last_chat_reset_at,

@@ -4,8 +4,12 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
+from fastapi import HTTPException, status
 from app.core.database import db
 from app.core.config import settings
+
+# ✅ NEW IMPORT: Required for Write-Through Caching
+from app.auth.dependency import update_user_cache
 
 logger = logging.getLogger("tradeomen.quota")
 
@@ -35,17 +39,24 @@ class QuotaServiceUnavailable(QuotaError):
 
 class QuotaManager:
 
+    # --------------------------------------------------------------
+    # 1. Plan & Limit Resolution
+    # --------------------------------------------------------------
     @staticmethod
     def _plan(user_profile: Dict[str, Any]) -> str:
-        # 1. Extract plan from profile
+        """
+        Resolves the effective plan ID from the user context.
+        Handles aliases (e.g. LIFETIME -> PREMIUM).
+        """
         raw_plan = (
             user_profile.get("plan_tier") or 
             user_profile.get("active_plan_id") or 
+            user_profile.get("plan_id") or
             user_profile.get("plan") or 
             settings.DEFAULT_PLAN
         ).upper()
         
-        # 2. Normalize Legacy/Alias plans
+        # Normalize Legacy/Alias plans
         if raw_plan in ("FOUNDER", "LIFETIME", "LIFETIME_PRO"):
             return "PREMIUM"
             
@@ -56,57 +67,67 @@ class QuotaManager:
         return settings.get_plan_limits(plan)
 
     # --------------------------------------------------------------
-    # Feature Flags (Async for DB Fallback)
+    # 2. Universal Permission Check (Features)
     # --------------------------------------------------------------
-
     @staticmethod
-    async def require_feature(user_profile: Dict[str, Any], flag: str) -> None:
+    def require_feature(user: Dict[str, Any], flag: str) -> None:
         """
-        Checks if a feature is allowed based on configuration limits.
-        Falls back to DB lookup if the profile dict seems stale.
+        Zero-DB check for feature flags (e.g. 'allow_screenshots').
         """
-        # 1. Check using the passed profile object first (Fast)
-        plan = QuotaManager._plan(user_profile)
-        plan_limits = QuotaManager.limits(plan)
+        plan = QuotaManager._plan(user)
+        limits = QuotaManager.limits(plan)
         
-        # 2. If explicitly allowed by config, return immediately
-        if plan_limits.get(flag, False):
+        if not limits.get(flag, False):
+             raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Plan upgrade required for feature: {flag}"
+            )
+
+    # --------------------------------------------------------------
+    # 3. Chat & AI Limits (Optimized)
+    # --------------------------------------------------------------
+    @staticmethod
+    def validate_chat_access(user: Dict[str, Any]) -> None:
+        """
+        Checks if the user can send a chat message.
+        - Premium: Returns immediately (0 DB calls).
+        - Free: Checks cached counters from dependency.py (0 DB calls).
+        """
+        plan = QuotaManager._plan(user)
+        limits = QuotaManager.limits(plan)
+        
+        # ✅ FAST PATH: If limit is None (Unlimited), return immediately.
+        limit_count = limits.get("daily_chat_msgs")
+        if limit_count is None:
             return
 
-        # 3. If denied/missing, try fetching fresh from DB (Source of Truth)
-        #    This handles cases where 'current_user' is a stale JWT payload.
-        user_id = user_profile.get("user_id") or user_profile.get("id")
+        # LOGIC: Lazy Reset (In-Memory)
+        # We rely on the data fetched in dependency.py (cached for 180s)
+        last_reset = user.get("last_chat_reset_at")
+        current_usage = user.get("daily_chat_count", 0)
         
-        if user_id:
-            try:
-                # Fetch only the plan fields
-                row = await db.fetch_one("""
-                    SELECT plan_tier, active_plan_id 
-                    FROM public.user_profiles 
-                    WHERE id = $1
-                """, user_id)
-                
-                if row:
-                    # Re-evaluate with DB data
-                    db_plan = QuotaManager._plan(dict(row))
-                    db_limits = QuotaManager.limits(db_plan)
-                    
-                    if db_limits.get(flag, False):
-                        return
-                    
-                    # Update variable for logging
-                    plan = db_plan 
+        now = datetime.now(timezone.utc)
+        
+        # If reset was yesterday (or never), effective usage is 0
+        if not last_reset:
+             current_usage = 0
+        else:
+             # Handle string vs datetime object from DB driver
+             if isinstance(last_reset, str):
+                 try:
+                     last_reset = datetime.fromisoformat(last_reset)
+                 except ValueError:
+                     last_reset = now # Fallback
+                     
+             # If cached reset time is from a previous day, usage is effectively 0
+             if last_reset.date() < now.date():
+                 current_usage = 0
 
-            except Exception as e:
-                logger.warning(f"Failed to fetch fresh plan for feature check: {e}")
-
-        # 4. If still denied, raise error
-        logger.warning(f"Feature locked: {flag} for plan {plan} (User ID: {user_id})")
-        raise FeatureLockedError(flag)
-
-    # --------------------------------------------------------------
-    # AI TOKEN RESERVATION
-    # --------------------------------------------------------------
+        if current_usage >= limit_count:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Daily chat limit ({limit_count}) reached. Upgrade for unlimited."
+            )
 
     @staticmethod
     async def reserve_ai_tokens(
@@ -114,16 +135,19 @@ class QuotaManager:
         user_profile: Dict[str, Any],
         estimated_tokens: int,
     ) -> None:
-
+        """
+        Reserves tokens for AI usage.
+        Premium users skip the DB transaction entirely.
+        Updates Cache on success.
+        """
         if estimated_tokens > MAX_TOKENS_PER_REQUEST:
             raise QuotaExceededError("Request too large")
 
         plan = QuotaManager._plan(user_profile)
         limits = QuotaManager.limits(plan)
         
-        # Robustness: Rely on config. If limit is None, it is unlimited.
+        # ✅ FAST PATH: Unlimited plans skip DB reservation
         token_limit = limits.get("monthly_ai_tokens_limit")
-
         if token_limit is None:
             return
 
@@ -131,6 +155,7 @@ class QuotaManager:
 
         try:
             async with db.transaction() as conn:
+                # 1. Lazy Reset if needed
                 await conn.execute("""
                     UPDATE public.user_profiles
                     SET monthly_ai_tokens_used = 0,
@@ -138,11 +163,13 @@ class QuotaManager:
                     WHERE id = $1
                       AND (
                         quota_reset_at IS NULL OR
-                        quota_reset_at < date_trunc('month', $2)
+                        quota_reset_at < date_trunc('month', $2::timestamptz)
                       )
                 """, user_id, now)
 
-                row = await conn.fetchrow("""
+                # 2. Atomic Increment & Check (RETURNING new value)
+                # ✅ FIX: Use fetch_val to get the new usage for cache update
+                new_usage = await conn.fetch_val("""
                     UPDATE public.user_profiles
                     SET monthly_ai_tokens_used = monthly_ai_tokens_used + $2
                     WHERE id = $1
@@ -150,8 +177,11 @@ class QuotaManager:
                     RETURNING monthly_ai_tokens_used
                 """, user_id, estimated_tokens, token_limit)
 
-                if not row:
-                    raise QuotaExceededError("AI token limit exceeded")
+                if new_usage is None:
+                    raise QuotaExceededError("Monthly AI token limit exceeded")
+                
+                # ✅ FIX: Update Cache Immediately (Write-Through)
+                update_user_cache(user_id, {"monthly_ai_tokens_used": new_usage})
 
         except QuotaError:
             raise
@@ -160,13 +190,64 @@ class QuotaManager:
             raise QuotaServiceUnavailable()
 
     # --------------------------------------------------------------
-    # COUNTERS
+    # 4. Database Bound Checks (Trades/Strategies)
     # --------------------------------------------------------------
+    @staticmethod
+    async def check_trade_limit(user: Dict[str, Any]) -> None:
+        """
+        Checks if user has reached monthly trade limit.
+        Premium users skip the count query.
+        """
+        plan = QuotaManager._plan(user)
+        limits = QuotaManager.limits(plan)
+        max_trades = limits.get("max_trades_per_month")
+        
+        # ✅ FAST PATH: Premium users skip the COUNT(*) query
+        if max_trades is None:
+            return
+
+        # Only run Count Query for Free/Pro users
+        user_id = user["user_id"]
+        count = await db.fetch_val("""
+            SELECT COUNT(*) FROM trades 
+            WHERE user_id = $1 
+            AND created_at >= date_trunc('month', NOW())
+        """, user_id)
+        
+        if count >= max_trades:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS, 
+                detail=f"Monthly trade limit ({max_trades}) reached."
+            )
 
     @staticmethod
+    async def check_strategy_limit(user: Dict[str, Any]) -> None:
+        plan = QuotaManager._plan(user)
+        limits = QuotaManager.limits(plan)
+        max_strat = limits.get("max_strategies")
+        
+        if max_strat is None: 
+            return
+
+        count = await db.fetch_val("SELECT COUNT(*) FROM strategies WHERE user_id = $1", user["user_id"])
+        if count >= max_strat:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS, 
+                detail=f"Strategy limit ({max_strat}) reached."
+            )
+
+    # --------------------------------------------------------------
+    # 5. Background Updates (Fire & Forget with Cache Sync)
+    # --------------------------------------------------------------
+    @staticmethod
     async def increment_daily_chat(user_id: str) -> None:
+        """
+        Increments the chat counter in the background. 
+        Updates DB AND Cache.
+        """
         try:
-            await db.execute("""
+            # ✅ FIX: Use fetch_val with RETURNING to get new count for cache
+            new_count = await db.fetch_val("""
                 UPDATE public.user_profiles
                 SET daily_chat_count =
                     CASE
@@ -177,15 +258,25 @@ class QuotaManager:
                     END,
                     last_chat_reset_at = NOW()
                 WHERE id = $1
+                RETURNING daily_chat_count
             """, user_id)
+            
+            # ✅ FIX: Update Cache Immediately (Write-Through)
+            if new_count is not None:
+                update_user_cache(user_id, {
+                    "daily_chat_count": new_count,
+                    "last_chat_reset_at": datetime.now() # Approximate is fine for cache
+                })
+                
         except Exception:
             logger.exception("Failed to increment chat counter")
-            raise QuotaServiceUnavailable()
+            pass
 
     @staticmethod
     async def increment_csv_import(user_id: str) -> None:
         try:
-            await db.execute("""
+            # ✅ FIX: Use fetch_val with RETURNING
+            new_count = await db.fetch_val("""
                 UPDATE public.user_profiles
                 SET monthly_import_count =
                     CASE
@@ -196,13 +287,22 @@ class QuotaManager:
                     END,
                     quota_reset_at = NOW()
                 WHERE id = $1
+                RETURNING monthly_import_count
             """, user_id)
+            
+            # ✅ FIX: Update Cache Immediately
+            if new_count is not None:
+                update_user_cache(user_id, {"monthly_import_count": new_count})
+
         except Exception:
             logger.exception("CSV quota increment failed")
-            raise QuotaServiceUnavailable()
+            pass
 
     @staticmethod
     async def get_usage(user_id: str) -> Dict[str, Any]:
+        """
+        API Endpoint Helper: Returns current usage stats.
+        """
         try:
             row = await db.fetch_one("""
                 SELECT plan_tier,

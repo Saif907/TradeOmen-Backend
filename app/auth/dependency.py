@@ -31,6 +31,17 @@ security = HTTPBearer(auto_error=True)
 _USER_CACHE: Dict[str, Dict[str, Any]] = {}
 CACHE_TTL_SECONDS = 180
 
+# ✅ NEW HELPER: Write-Through Cache Update
+# This allows QuotaManager to sync updates immediately, preventing stale data.
+def update_user_cache(user_id: str, updates: Dict[str, Any]) -> None:
+    """
+    Updates the in-memory cache with fresh values (Write-Through).
+    This prevents stale data from allowing users to bypass quotas.
+    """
+    if user_id in _USER_CACHE:
+        # Update only the fields provided, keep the rest (like plan_id) intact
+        _USER_CACHE[user_id]["data"].update(updates)
+
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> Dict[str, Any]:
@@ -98,11 +109,17 @@ async def get_current_user(
         # ✅ CACHE MISS: Record stat and fetch from DB
         await PerformanceMonitor.record_auth_cache(hit=False)
         try:
+            # ✅ OPTIMIZATION: Fetch ALL counters in one go.
+            # This eliminates the need for permissions.py to re-query the DB.
             query = """
                 SELECT
                     id,
                     active_plan_id,
-                    ai_chat_quota_used,
+                    daily_chat_count,
+                    last_chat_reset_at,
+                    monthly_ai_tokens_used,
+                    monthly_import_count,
+                    quota_reset_at,
                     preferences
                 FROM public.user_profiles
                 WHERE id = $1
@@ -118,16 +135,16 @@ async def get_current_user(
                 full_name = user_metadata.get("full_name") or user_metadata.get("name") or ""
                 
                 # Create the missing profile on the fly
+                # Defaults: chat_count=0, tokens=0 via DB schema defaults
                 insert_query = """
                     INSERT INTO public.user_profiles (
                         id, 
                         email, 
                         full_name, 
                         active_plan_id, 
-                        ai_chat_quota_used,
                         preferences
-                    ) VALUES ($1, $2, $3, 'free', 0, '{}')
-                    RETURNING id, active_plan_id, ai_chat_quota_used, preferences
+                    ) VALUES ($1, $2, $3, 'free', '{}')
+                    RETURNING id, active_plan_id, preferences
                 """
                 try:
                     row = await db.fetch_one(
@@ -170,8 +187,19 @@ async def get_current_user(
         "user_id": user_profile["id"],
         "role": auth_payload.get("role"),
         "email": email,
-        "plan_id": user_profile["active_plan_id"],
-        "ai_chat_quota_used": user_profile["ai_chat_quota_used"],
+        
+        # ✅ Plan Details (Mapped correctly for trades.py)
+        "plan_id": user_profile.get("active_plan_id"),
+        "active_plan_id": user_profile.get("active_plan_id"),
+        "plan_tier": user_profile.get("active_plan_id"),  # Alias for compatibility
+        
+        # ✅ Usage Counters (Passed to QuotaManager to avoid extra DB calls)
+        "daily_chat_count": user_profile.get("daily_chat_count", 0),
+        "last_chat_reset_at": user_profile.get("last_chat_reset_at"),
+        "monthly_ai_tokens_used": user_profile.get("monthly_ai_tokens_used", 0),
+        "monthly_import_count": user_profile.get("monthly_import_count", 0),
+        "quota_reset_at": user_profile.get("quota_reset_at"),
+        
         "preferences": user_profile.get("preferences", {}),
         "auth_claims": auth_payload,
     }

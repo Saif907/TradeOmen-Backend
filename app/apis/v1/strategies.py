@@ -1,3 +1,5 @@
+# backend/app/apis/v1/strategies.py
+
 import logging
 import json
 import uuid
@@ -9,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from app.core.config import settings
 from app.core.database import db
 from app.auth.dependency import get_current_user
+from app.services.quota_manager import QuotaManager  # ✅ NEW IMPORT
 
 # Ensure these schemas exist in app/schemas/strategy_schemas.py
 from app.schemas.strategy_schemas import (
@@ -61,28 +64,6 @@ def _serialize_row(row: Any) -> Dict[str, Any]:
     return d
 
 
-async def _check_strategy_quota(user_id: str, plan_tier: str):
-    """
-    Enforce strategy count limits using fast SQL.
-    """
-    # Robust: Rely on config limits. If limit is None, it is unlimited.
-    limits = settings.get_plan_limits(plan_tier)
-    # "max_strategies" key comes from config.py PLAN_DEFINITIONS
-    max_count = limits.get("max_strategies")
-
-    if max_count is None: # Unlimited
-        return
-
-    query = "SELECT COUNT(*) FROM strategies WHERE user_id = $1"
-    count = await db.fetch_val(query, user_id)
-    
-    if count >= max_count:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail=f"Strategy limit reached ({max_count}) for {plan_tier} plan."
-        )
-
-
 # ---------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------
@@ -126,8 +107,9 @@ async def create_strategy(
 ):
     user_id = _get_user_id(current_user)
     
-    # 1. Enforce Quota
-    await _check_strategy_quota(user_id, current_user.get("plan_tier", "FREE"))
+    # ✅ 1. Enforce Quota (Centralized)
+    # Premium users skip the count query automatically.
+    await QuotaManager.check_strategy_limit(current_user)
 
     # 2. Prepare Data
     data = strategy.model_dump()

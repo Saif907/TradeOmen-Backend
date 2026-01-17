@@ -142,7 +142,7 @@ class Settings(BaseSettings):
     PERPLEXITY_API_KEY: Optional[str] = None
 
     LLM_PROVIDER: Literal["openai", "gemini", "perplexity"] = "gemini"
-    LLM_MODEL: str = "gemini-1.5-flash"
+    LLM_MODEL: str = "gemini-2.5-flash"
     SANITIZE_PII: bool = True
 
     # --------------------------------------------------
@@ -194,8 +194,8 @@ class Settings(BaseSettings):
             "display_name": "Premium",
             "max_trades_per_month": None,
             "max_strategies": None,
-            "daily_chat_msgs": 200,
-            "monthly_ai_tokens_limit": 10_000_000,
+            "daily_chat_msgs":None,
+            "monthly_ai_tokens_limit": None,
             "monthly_csv_imports": None,
             "max_broker_accounts": 10,
             "allow_tags": True,

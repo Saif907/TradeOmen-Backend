@@ -1,11 +1,11 @@
+# backend/app/apis/v1/trades.py
+
 import logging
 import json
 import asyncio
-import io
-import csv
 from uuid import uuid4
 from datetime import datetime
-from typing import List, Dict, Any, AsyncGenerator, Optional
+from typing import List, Dict, Any, AsyncGenerator
 
 from fastapi import (
     APIRouter,
@@ -24,7 +24,7 @@ from app.core.config import settings
 from app.core.database import db
 from app.auth.dependency import get_current_user
 from app.lib.data_sanitizer import sanitizer
-from app.services.quota_manager import QuotaManager
+from app.services.quota_manager import QuotaManager  # ✅ 1. Import QuotaManager
 from app.lib.encryption import crypto
 
 # Import schemas
@@ -151,24 +151,6 @@ class ScreenshotService:
         return await asyncio.gather(*tasks)
 
 
-async def _check_trade_quota(user_id: str, plan_tier: str):
-    # Robust: Rely on config limits. If limit is None, it is unlimited.
-    limits = settings.get_plan_limits(plan_tier)
-    max_trades = limits.get("max_trades_per_month")
-    
-    if max_trades is None: return
-
-    # Optimized count query
-    query = """
-        SELECT COUNT(*) FROM trades 
-        WHERE user_id = $1 
-        AND created_at >= date_trunc('month', NOW())
-    """
-    count = await db.fetch_val(query, user_id)
-    if count >= max_trades:
-        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, f"Monthly trade limit reached ({max_trades})")
-
-
 # ---------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------
@@ -183,32 +165,34 @@ async def create_trade(
     """
     user_id = TradeService._get_user_id(current_user)
     
-    # 1. Enforce Quotas & Feature Flags
-    await _check_trade_quota(user_id, current_user.get("plan_tier", "FREE"))
+    # ✅ 1. Enforce Quotas (Async Check)
+    # Premium users skip the DB count query automatically.
+    await QuotaManager.check_trade_limit(current_user)
 
+    # ✅ 2. Feature Flags (Sync Checks - Zero DB)
     if trade.screenshots:
-        await QuotaManager.require_feature(current_user, "allow_screenshots")
+        QuotaManager.require_feature(current_user, "allow_screenshots")
 
     if trade.tags:
-        await QuotaManager.require_feature(current_user, "allow_tags")
+        QuotaManager.require_feature(current_user, "allow_tags")
 
-    # 2. Notes: Store as PLAIN TEXT (Sanitized only)
+    # 3. Notes: Store as PLAIN TEXT (Sanitized only)
     notes = sanitizer.sanitize(trade.notes) if trade.notes else None
     
-    # 3. Screenshots: Encrypt path strings
+    # 4. Screenshots: Encrypt path strings
     screenshots_data = [
         s if s.startswith("gAAAA") else crypto.encrypt(s) 
         for s in (trade.screenshots or [])
     ]
     
-    # 4. PnL Calculation
+    # 5. PnL Calculation
     pnl = trade.pnl
     if pnl is None and trade.exit_price and trade.quantity:
         multiplier = 1 if trade.direction == "LONG" else -1
         diff = (trade.exit_price - trade.entry_price)
         pnl = (diff * trade.quantity * multiplier) - (trade.fees or 0)
 
-    # 5. Insert (Using positional args $1, $2...)
+    # 6. Insert (Using positional args $1, $2...)
     # ✅ Fix: Use $17 (text) for screenshots instead of $17::jsonb since the column is TEXT
     query = """
         INSERT INTO trades (
@@ -310,12 +294,12 @@ async def update_trade(
     if not update_data: 
         raise HTTPException(400, "No fields to update")
 
-    # Enforce Feature Flags during Update
+    # ✅ Feature Flags (Sync Checks - Zero DB)
     if "screenshots" in update_data and update_data["screenshots"]:
-        await QuotaManager.require_feature(current_user, "allow_screenshots")
+        QuotaManager.require_feature(current_user, "allow_screenshots")
 
     if "tags" in update_data and update_data["tags"]:
-        await QuotaManager.require_feature(current_user, "allow_tags")
+        QuotaManager.require_feature(current_user, "allow_tags")
 
     # Handle encryption/sanitization
     if "notes" in update_data:
@@ -389,8 +373,8 @@ async def export_trades(current_user: Dict[str, Any] = Depends(get_current_user)
     PRO Feature: Export trades to CSV.
     Uses Batched Streaming to prevent memory overflow (OOM) on large datasets.
     """
-    # Enforce Feature Flag
-    await QuotaManager.require_feature(current_user, "allow_export_csv")
+    # ✅ Enforce Feature Flag (Sync Check - Zero DB)
+    QuotaManager.require_feature(current_user, "allow_export_csv")
 
     user_id = TradeService._get_user_id(current_user)
 
@@ -446,8 +430,8 @@ async def upload_trade_screenshot(
 ):
     user_id = TradeService._get_user_id(current_user)
     
-    # Await the async quota check
-    await QuotaManager.require_feature(current_user, "allow_screenshots")
+    # ✅ Feature Flag (Sync Check - Zero DB)
+    QuotaManager.require_feature(current_user, "allow_screenshots")
 
     uploaded_results = []
     new_paths_encrypted = []

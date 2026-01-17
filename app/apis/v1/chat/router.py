@@ -1,7 +1,8 @@
+# backend/app/apis/v1/chat/router.py
+
 import logging
 import asyncio
 import uuid
-import json
 from typing import Dict, Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
@@ -9,7 +10,7 @@ from starlette.concurrency import run_in_threadpool
 from supabase import Client
 
 from app.auth.dependency import get_current_user
-from app.auth.permissions import validate_ai_usage_limits, check_import_quota
+# ✅ REMOVED: from app.auth.permissions import validate_ai_usage_limits, check_import_quota
 from app.services.quota_manager import QuotaManager
 from app.services.chat_pipeline import ChatPipeline
 from app.lib.data_sanitizer import sanitizer
@@ -52,7 +53,13 @@ async def _record_usage_background(user_id: str, profile: Dict[str, Any], tokens
     """
     try:
         await QuotaManager.increment_daily_chat(user_id)
-        await QuotaManager.reserve_ai_tokens(user_id, profile, tokens)
+        # Note: reserve_ai_tokens updates the cache/DB with the actual cost
+        # We use a dummy estimate here if this is just incrementing "usage" for reporting,
+        # but QuotaManager.reserve_ai_tokens is usually called BEFORE generation.
+        # If this is post-generation logging, you might just want logging.
+        # However, keeping your existing logic:
+        # await QuotaManager.reserve_ai_tokens(user_id, profile, tokens) 
+        pass
     except Exception as e:
         logger.error(f"Background usage update failed for user {user_id}: {e}")
 
@@ -149,11 +156,24 @@ async def upload_chat_file(
     file: UploadFile = File(...),
     session_id: str = Form(...),
     message: str = Form(""),
-    current_user: Dict[str, Any] = Depends(check_import_quota),
+    current_user: Dict[str, Any] = Depends(get_current_user), # ✅ Updated Dependency
 ):
     """
     Analyzes a CSV file structure and returns a preview/mapping suggestion.
     """
+    # ✅ 1. Manual Quota Check (Zero-DB)
+    limits = QuotaManager.limits(QuotaManager._plan(current_user))
+    limit = limits.get("monthly_csv_imports")
+    
+    if limit is not None:
+        # Used count comes from cached profile
+        used = current_user.get("monthly_import_count", 0)
+        if used >= limit:
+             raise HTTPException(
+                 status_code=status.HTTP_429_TOO_MANY_REQUESTS, 
+                 detail="Monthly CSV import limit reached."
+             )
+
     if not file.filename.endswith(".csv"):
         raise HTTPException(400, "Only CSV files are supported")
     
@@ -194,9 +214,16 @@ async def confirm_import(
     Placeholder: Actually processes the CSV and inserts trades.
     Requires downloading file from Storage based on payload.file_path.
     """
+    user_id = extract_user_id(current_user)
+    
     # 1. Download file from Storage using payload.file_path
     # 2. Parse using payload.mapping
     # 3. Insert trades
+    
+    # 4. Increment Quota (Async Background)
+    # Note: We update the quota *after* successful import
+    await QuotaManager.increment_csv_import(user_id)
+
     return {"status": "success", "count": 0}
 
 
@@ -206,10 +233,14 @@ async def confirm_import(
 @router.post("", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
-    user_profile: Dict[str, Any] = Depends(validate_ai_usage_limits),
+    current_user: Dict[str, Any] = Depends(get_current_user), # ✅ Updated Dependency
     supabase: Client = Depends(get_authenticated_client),
 ):
-    user_id = extract_user_id(user_profile)
+    user_id = extract_user_id(current_user)
+    
+    # ✅ 1. Validate Access (In-Memory Check)
+    QuotaManager.validate_chat_access(current_user)
+    
     raw_message = (request.message or "").strip()
     if not raw_message:
         raise HTTPException(400, "Message cannot be empty")
@@ -259,9 +290,8 @@ async def chat(
 
     # D. Process AI Response
     try:
-        # Pass web_search flag implicitly if needed by pipeline logic
-        # web_search = getattr(request, "web_search", False)
-        response_text = await ChatPipeline.process(user_id, message, history)
+        # ✅ Pass 'current_user' (profile dict) to pipeline for token management
+        response_text = await ChatPipeline.process(current_user, message, history)
     except Exception:
         logger.exception("Chat pipeline failure")
         response_text = "I encountered an error processing your request. Please try again."
@@ -279,8 +309,11 @@ async def chat(
     )
 
     # F. Usage Tracking (Async)
+    # Just increment daily chat count here. Token reservation happened in pipeline.
+    asyncio.create_task(QuotaManager.increment_daily_chat(user_id))
+
+    # Estimation for frontend display (not used for logic)
     est_tokens = max(1, int((len(message) + len(response_text)) / 4))
-    asyncio.create_task(_record_usage_background(user_id, user_profile, est_tokens))
 
     return {
         "response": response_text,

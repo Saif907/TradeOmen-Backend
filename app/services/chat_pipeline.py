@@ -1,34 +1,33 @@
 # backend/app/services/chat_pipeline.py
+
 import logging
 import json
 import re
 import uuid
 from typing import Dict, Any, List, Optional
 
+from app.core.config import settings
+from app.core.database import db
 from app.lib.llm_client import llm_client
 from app.services.chat_tools import ChatTools
 from app.services.quota_manager import QuotaManager
 from app.services.metrics_engine import MetricsEngine
-from app.core.database import db
+from app.auth.dependency import update_user_cache  # ✅ Import for cache sync
 
 logger = logging.getLogger("tradeomen.chat_pipeline")
 
+# -------------------------
+# CONSTANTS & CONFIG
+# -------------------------
+DEFAULT_MODEL = getattr(settings, "LLM_MODEL", "gemini-2.5-flash")
 
-# -------------------------
-# SCHEMA CONTEXT
-# -------------------------
 DB_SCHEMA_CONTEXT = """
 PostgreSQL schema (read-only). Use user_id = $1 for scoping.
-
 Tables:
 - trades(user_id, symbol, direction, status, pnl, entry_price, exit_price, fees, entry_time, instrument_type, strategy_id, tags)
 - strategies(id, user_id, name, style, description)
 """
 
-
-# -------------------------
-# KEYWORDS
-# -------------------------
 CORE_METRICS = {
     "pnl", "profit", "loss", "win rate", "winrate",
     "trades", "performance", "returns"
@@ -48,40 +47,28 @@ KEYWORDS_REASONING = {
     "suggest", "should i"
 }
 
-
 # -------------------------
-# SAFE JSON EXTRACTION (NO RECURSIVE REGEX)
+# SAFE JSON EXTRACTION
 # -------------------------
 _CODE_FENCE_RE = re.compile(r"(?s)```(?:\w+)?\n(.*?)```")
 _LEADING_DATA_RE = re.compile(r"(?m)^\s*data:\s*", flags=re.IGNORECASE)
 
-
 def _strip_code_fences_and_data_prefixes(text: str) -> str:
     if not text:
         return ""
-    # remove triple-backtick fences
     t = _CODE_FENCE_RE.sub(r"\1", text)
-    # remove common "data: " prefixes (from streaming)
     t = _LEADING_DATA_RE.sub("", t)
     return t.strip()
 
-
 def extract_json_object(text: str) -> Dict[str, Any]:
-    """
-    Safely extract the first valid JSON object from the LLM response.
-    Scans for a balanced {...} substring rather than using recursive regex.
-    Raises ValueError if none found or JSON decode fails.
-    """
     if not text or not text.strip():
         raise ValueError("Empty LLM response")
 
     s = _strip_code_fences_and_data_prefixes(text)
 
-    # Fast path: the whole response is JSON
     if s.startswith("{") and s.endswith("}"):
         return json.loads(s)
 
-    # Find first '{'
     start = s.find("{")
     if start == -1:
         raise ValueError("No JSON object found")
@@ -99,25 +86,17 @@ def extract_json_object(text: str) -> Dict[str, Any]:
 
     raise ValueError("Unbalanced JSON braces in LLM response")
 
-
 # -------------------------
-# SQL Validation Helpers
+# SQL Validation
 # -------------------------
 FORBIDDEN_SQL_PATTERNS = [
-    r";",                         # stacked queries or trailing semicolons
+    r";", 
     r"\bINSERT\b", r"\bUPDATE\b", r"\bDELETE\b",
     r"\bDROP\b", r"\bALTER\b", r"\bTRUNCATE\b", r"\bCREATE\b",
     r"\bEXEC\b", r"\bCALL\b", r"\bGRANT\b", r"\bREVOKE\b"
 ]
 
-
 def validate_sql(sql: str) -> bool:
-    """
-    Conservative SQL validator. Returns True if SQL is allowed to execute.
-    - Must start with SELECT or WITH.
-    - Must include user_id = $1 (scoping).
-    - Must not contain forbidden patterns.
-    """
     if not sql or not isinstance(sql, str):
         return False
 
@@ -130,60 +109,47 @@ def validate_sql(sql: str) -> bool:
         if re.search(pat, normalized, re.IGNORECASE):
             return False
 
+    # Strict scoping check
     if "user_id = $1" not in normalized and "user_id=$1" not in normalized:
         return False
 
     return True
 
-
 # -------------------------
-# Token estimation + safe LLM call (with conservative rollback)
+# Token estimation + Safe LLM call
 # -------------------------
 def estimate_tokens_from_messages(messages: List[Dict[str, str]]) -> int:
-    """
-    Heuristic: ~1 token per 4 characters (conservative).
-    """
     text = " ".join(m.get("content", "") for m in messages)
     return max(1, int(len(text) / 4))
 
-
 async def llm_safe_call(
-    user_id: str,
+    user_profile: Dict[str, Any],  # ✅ Accept Profile (No DB Fetch)
     messages: List[Dict[str, str]],
     model: str,
     request_id: str,
     estimated_output_ratio: float = 1.0,
 ) -> Dict[str, Any]:
     """
-    Reserve tokens, call LLM, then commit usage. If LLM call fails, attempt a conservative rollback
-    by decrementing the previously reserved token count in the DB (best-effort).
+    Reserve tokens, call LLM, then commit usage. 
+    Handles rollback for both DB and Cache if LLM fails.
     """
-    # estimate
+    user_id = user_profile["user_id"]
+    
+    # 1. Estimate
     input_tokens = estimate_tokens_from_messages(messages)
     estimated_output = int(input_tokens * estimated_output_ratio) + 10
     estimated_total = input_tokens + estimated_output
 
-    # Load fresh user_profile (for atomic reservation)
-    user_profile = {}
-    try:
-        user_profile = await db.fetch_one(
-            "SELECT id, plan_tier, monthly_ai_tokens_used, quota_reset_at FROM public.user_profiles WHERE id = $1",
-            user_id,
-        ) or {}
-    except Exception:
-        # proceed with empty profile if DB read fails (quota_manager will treat it defensively)
-        logger.debug("Could not load user profile for token reservation; proceeding with fallback")
-
-    # Reserve tokens (atomic). This raises if insufficient tokens.
+    # 2. Reserve tokens (Uses QuotaManager's efficient logic)
     await QuotaManager.reserve_ai_tokens(user_id, user_profile, estimated_total)
 
     try:
-        # Call provider
+        # 3. Call Provider
         resp = await llm_client.generate_response(messages, model=model)
         content = resp.get("content", "")
         actual_output_tokens = max(0, int(len(content) / 4))
 
-        # Best-effort log of actual usage
+        # 4. Async Logging (Fire & Forget)
         try:
             await MetricsEngine.log_ai_usage(
                 user_id=user_id,
@@ -195,44 +161,56 @@ async def llm_safe_call(
                 context="chat_pipeline",
             )
         except Exception:
-            logger.debug("Metrics logging failed (non-fatal)")
+            pass
 
         return resp
 
     except Exception as e:
-        logger.exception("LLM call failed; attempting to rollback reserved tokens", extra={"request_id": request_id, "user_id": user_id})
+        logger.exception("LLM call failed; attempting rollback", extra={"request_id": request_id, "user_id": user_id})
 
-        # Best-effort rollback: decrement monthly_ai_tokens_used by estimated_total,
-        # only if monthly_ai_tokens_used >= estimated_total (avoid negative counts).
+        # 5. Rollback Logic (DB + Cache)
+        # We must restore the tokens to prevent unfair blocking.
         try:
-            await db.execute(
+            new_val = await db.fetch_val(
                 """
                 UPDATE public.user_profiles
-                SET monthly_ai_tokens_used = monthly_ai_tokens_used - $2
-                WHERE id = $1 AND monthly_ai_tokens_used >= $2
+                SET monthly_ai_tokens_used = GREATEST(0, monthly_ai_tokens_used - $2)
+                WHERE id = $1
+                RETURNING monthly_ai_tokens_used
                 """,
                 user_id,
                 estimated_total,
             )
-            logger.info("Rolled back reserved tokens (best-effort) for user %s", user_id)
+            
+            # ✅ Sync Cache so the user isn't blocked in RAM
+            if new_val is not None:
+                update_user_cache(user_id, {"monthly_ai_tokens_used": new_val})
+                logger.info("Rolled back reserved tokens for user %s", user_id)
+                
         except Exception:
-            logger.exception("Failed to rollback reserved tokens (best-effort)")
+            logger.exception("Failed to rollback reserved tokens")
 
         raise
-
 
 # -------------------------
 # ChatPipeline
 # -------------------------
 class ChatPipeline:
-    """
-    Orchestrates safe intent classification, optional SQL generation & execution,
-    and LLM synthesis. Backend rules are authoritative.
-    """
-
+    
     @staticmethod
-    async def process(user_id: str, message: str, history: List[Dict[str, str]]) -> str:
+    async def process(
+        user_profile: Dict[str, Any],  # ✅ Changed from user_id to user_profile
+        message: str, 
+        history: List[Dict[str, str]]
+    ) -> str:
+        """
+        Main pipeline entrypoint. 
+        NOTE: Caller must pass the full 'user_profile' (current_user) to avoid N+1 DB lookups.
+        """
+        user_id = user_profile["user_id"]
         request_id = str(uuid.uuid4())
+        
+        # 1. Classify
         intent = await ChatPipeline._classify_intent(message)
         intent_type = intent.get("type", "GENERAL")
         intent_args = intent.get("args", {})
@@ -268,7 +246,8 @@ class ChatPipeline:
             logger.exception("ChatPipeline execution error", extra={"request_id": request_id, "user_id": user_id})
             context = {"status": "error", "message": "Internal processing error."}
 
-        return await ChatPipeline._synthesize_answer(user_id, message, context, history, request_id=request_id)
+        # 2. Synthesize
+        return await ChatPipeline._synthesize_answer(user_profile, message, context, history, request_id=request_id)
 
     # -------------------------
     # INTENT CLASSIFICATION
@@ -286,32 +265,30 @@ class ChatPipeline:
             return {"type": "GENERAL"}
 
         prompt = """
-Classify the user request into exactly ONE of these types.
-Return JSON ONLY.
+        Classify the user request into exactly ONE of these types.
+        Return JSON ONLY.
 
-TYPES:
-- STANDARD_METRICS
-- DATA_QUERY
-- REASONING_ONLY
-- GENERAL
+        TYPES:
+        - STANDARD_METRICS
+        - DATA_QUERY
+        - REASONING_ONLY
+        - GENERAL
 
-Return format:
-{ "type": "...", "args": { } }
-"""
+        Return format:
+        { "type": "...", "args": { } }
+        """
 
         try:
             resp = await llm_client.generate_response(
                 [{"role": "system", "content": prompt}, {"role": "user", "content": message}],
-                model="gemini-2.5-flash",
+                model=DEFAULT_MODEL,
             )
             content = resp.get("content", "")
             try:
                 return extract_json_object(content)
             except Exception:
-                logger.debug("Intent LLM returned non-json; falling back to GENERAL")
                 return {"type": "GENERAL"}
         except Exception:
-            logger.warning("Intent classification failed", exc_info=True)
             return {"type": "GENERAL"}
 
     # -------------------------
@@ -325,12 +302,11 @@ Return format:
         if any(k in t for k in KEYWORDS_REASONING):
             return False
 
-        # Conservative default: ask LLM but default to True on error
         prompt = f"Does this message require querying the user's database? Answer YES or NO only.\n\nMessage: \"{message}\""
         try:
             resp = await llm_client.generate_response(
                 [{"role": "system", "content": "Answer YES or NO only."}, {"role": "user", "content": prompt}],
-                model="gemini-2.5-flash",
+                model=DEFAULT_MODEL,
             )
             return resp.get("content", "").strip().upper().startswith("Y")
         except Exception:
@@ -342,24 +318,19 @@ Return format:
     @staticmethod
     async def _generate_sql(message: str) -> str:
         system_prompt = f"""
-You generate a single PostgreSQL SELECT (or WITH ... SELECT) query, RAW SQL only.
-
-SCHEMA:
-{DB_SCHEMA_CONTEXT}
-
-RULES (critical):
-- Generate SQL ONLY if data is required. If not, return exactly NO_SQL.
-- Use only SELECT / WITH ... SELECT.
-- ALWAYS include `user_id = $1` in any WHERE clause.
-- Prefer aggregates (SUM, AVG, COUNT).
-- Do NOT include LIMIT (the caller will append it).
-- Do not include destructive operations.
-Return the SQL string only.
-"""
+        You generate a single PostgreSQL SELECT (or WITH ... SELECT) query, RAW SQL only.
+        SCHEMA: {DB_SCHEMA_CONTEXT}
+        RULES:
+        - Generate SQL ONLY if data is required. If not, return exactly NO_SQL.
+        - Use only SELECT / WITH ... SELECT.
+        - ALWAYS include `user_id = $1` in any WHERE clause.
+        - Prefer aggregates (SUM, AVG, COUNT).
+        - No destructive operations.
+        """
         try:
             resp = await llm_client.generate_response(
                 [{"role": "system", "content": system_prompt}, {"role": "user", "content": message}],
-                model="gemini-2.5-flash",
+                model=DEFAULT_MODEL,
             )
             sql = resp.get("content", "").replace("```sql", "").replace("```", "").strip()
             return sql if sql else "NO_SQL"
@@ -371,44 +342,43 @@ Return the SQL string only.
     # -------------------------
     @staticmethod
     async def _synthesize_answer(
-        user_id: str,
+        user_profile: Dict[str, Any], # ✅ Accepts Profile
         message: str,
         context: Dict[str, Any],
         history: List[Dict[str, str]],
         request_id: Optional[str] = None,
     ) -> str:
-        # compact context to avoid huge payloads
+        # Compact context
         safe_context = dict(context)
         if isinstance(safe_context.get("data"), list):
-            safe_context["data"] = safe_context["data"][:10]
+            safe_context["data"] = safe_context["data"][:15] # Limit rows
 
         if "preferences" in safe_context:
             safe_context["preferences"] = "[REDACTED]"
 
         system_prompt = f"""
-You are a concise, factual Trading Analyst. Use ONLY the provided context data to answer, be actionable and clear.
-
-CONTEXT:
-{json.dumps(safe_context, default=str)[:30_000]}
-RULES:
-- If context.status == 'error' -> apologize briefly and explain the error.
-- If context.data is empty -> say "I found no matching trades."
-- Never invent numbers not present in the context.
-- Round numeric values to 2 decimals where applicable.
-"""
+        You are a concise, factual Trading Analyst. Use ONLY the provided context data to answer.
+        CONTEXT:
+        {json.dumps(safe_context, default=str)[:30_000]}
+        RULES:
+        - If status == 'error', explain the error.
+        - If data is empty, say "I found no matching trades."
+        - Round numeric values to 2 decimals.
+        """
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history[-2:] if history else [])
         messages.append({"role": "user", "content": message})
 
         try:
+            # ✅ Use Safe Call with Profile (No extra DB fetch)
             resp = await llm_safe_call(
-                user_id=user_id,
+                user_profile=user_profile,
                 messages=messages,
-                model="gemini-2.5-flash",
+                model=DEFAULT_MODEL,
                 request_id=request_id or str(uuid.uuid4()),
                 estimated_output_ratio=1.0,
             )
             return resp.get("content", "I'm having trouble generating the answer right now.")
         except Exception:
-            logger.exception("Synthesis failed", extra={"request_id": request_id, "user_id": user_id})
+            logger.exception("Synthesis failed", extra={"request_id": request_id, "user_id": user_profile["user_id"]})
             return "I'm having trouble generating the answer right now."

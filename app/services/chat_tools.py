@@ -1,4 +1,5 @@
 # backend/app/services/chat_tools.py
+
 import logging
 import re
 from uuid import UUID
@@ -33,17 +34,23 @@ class ChatTools:
     # UUID SAFETY
     # -----------------------------
     @staticmethod
-    def _to_uuid(user_id: str):
+    def _to_uuid(user_id: Any) -> UUID:
+        """
+        Robustly converts input to UUID.
+        Handles strings, standard UUIDs, and asyncpg UUID objects.
+        """
         try:
-            return UUID(user_id)
+            if isinstance(user_id, UUID):
+                return user_id
+            return UUID(str(user_id))
         except Exception:
-            raise ValueError("Invalid user_id")
+            raise ValueError(f"Invalid user_id format: {user_id}")
 
     # -----------------------------
     # STANDARD METRICS (SAFE PATH)
     # -----------------------------
     @staticmethod
-    async def get_standard_metrics(user_id: str, period: str = "ALL_TIME") -> Dict[str, Any]:
+    async def get_standard_metrics(user_id: Any, period: str = "ALL_TIME") -> Dict[str, Any]:
         uid = ChatTools._to_uuid(user_id)
 
         date_clause = "TRUE"
@@ -66,6 +73,7 @@ class ChatTools:
               AND {date_clause}
         """
 
+        # ✅ FIX: Pass 'uid' as a positional argument (no values=...)
         row = await db.fetch_one(sql, uid)
 
         if not row or row["total_trades"] == 0:
@@ -90,7 +98,7 @@ class ChatTools:
     # DYNAMIC SQL (STRICT)
     # -----------------------------
     @staticmethod
-    async def execute_secure_sql(user_id: str, sql: str) -> Dict[str, Any]:
+    async def execute_secure_sql(user_id: Any, sql: str) -> Dict[str, Any]:
         if not sql:
             raise ValueError("Empty SQL")
 
@@ -129,15 +137,18 @@ class ChatTools:
         uid = ChatTools._to_uuid(user_id)
 
         try:
+            # ✅ FIX: Use db.transaction() to get the asyncpg connection 'conn'
             async with db.transaction() as conn:
                 await conn.execute(
                     f"SET LOCAL statement_timeout = {ChatTools.STATEMENT_TIMEOUT_MS}"
                 )
+                
+                # ✅ FIX: Use 'conn.fetch' (asyncpg) and positional args
                 rows = await conn.fetch(sql, uid)
 
-        except Exception:
+        except Exception as e:
             logger.exception("Secure SQL execution failed")
-            raise RuntimeError("Query execution failed")
+            raise RuntimeError(f"Query execution failed: {str(e)}")
 
         data = [dict(r) for r in rows]
 
