@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
@@ -151,7 +151,7 @@ def get_dhan_auth_url(
     user_id = current_user["sub"]
     state = _build_state_for_user(user_id)
 
-    # ✅ URL-ENCODE redirect URI (THIS WAS MISSING)
+    # ✅ URL-ENCODE redirect URI
     encoded_redirect = quote(settings.DHAN_REDIRECT_URI, safe="")
 
     authorize_url = (
@@ -164,7 +164,6 @@ def get_dhan_auth_url(
     return {"url": authorize_url}
 
 
-
 @router.get("/dhan/callback")
 def dhan_callback(request: Request):
     """
@@ -175,9 +174,8 @@ def dhan_callback(request: Request):
     token_id = params.get("tokenId") or params.get("token_id") or params.get("code")
     state = params.get("state")
     if not token_id:
-        # redirect to frontend with an error
         return RedirectResponse(f"{settings.FRONTEND_URL}/settings/accounts?error=dhan_missing_token")
-    # Redirect user to frontend process route (frontend will POST tokenId+state to protected endpoint)
+    
     redirect_to = f"{settings.FRONTEND_URL}/settings/accounts?tokenId={token_id}"
     if state:
         redirect_to += f"&state={state}"
@@ -192,8 +190,6 @@ async def connect_dhan_broker(
 ):
     """
     Backend endpoint to exchange tokenId -> access_token, validate it, and persist to Supabase.
-    Protected by Bearer auth (frontend must call this while the user is authenticated).
-    payload: { "tokenId": "...", "state": "..." }
     """
     user_id = current_user["sub"]
     token_id = payload.get("tokenId") or payload.get("token_id")
@@ -202,11 +198,9 @@ async def connect_dhan_broker(
     if not token_id:
         raise HTTPException(status_code=400, detail="tokenId is required")
 
-    # Validate state ties to this user
     if not state or not _validate_state_for_user(state, user_id):
         raise HTTPException(status_code=400, detail="Invalid or missing state parameter")
 
-    # Exchange token
     exchanged = await DhanAdapter.exchange_token(token_id)
     if not exchanged or not exchanged.get("access_token"):
         logger.error("Dhan token exchange failed for user %s", user_id)
@@ -215,22 +209,18 @@ async def connect_dhan_broker(
     access_token = exchanged["access_token"]
     expires_at = exchanged.get("expires_at")
 
-    # Validate token right away
     adapter = DhanAdapter({"access_token": access_token})
     ok = await adapter.authenticate()
     if not ok:
         raise HTTPException(status_code=400, detail="Dhan token validation failed after exchange")
 
-    # Persist encrypted credentials to Supabase (upsert semantics)
     creds_obj = {"access_token": access_token}
     if expires_at:
         creds_obj["expires_at"] = expires_at
     creds_json = json.dumps(creds_obj)
     encrypted = crypto.encrypt(creds_json)
 
-    # Upsert: update if exists else insert
     try:
-        # Try to find an existing Dhan record for this user
         existing = (
             supabase.table("broker_accounts")
             .select("id")
@@ -271,9 +261,6 @@ async def connect_dhan_broker(
         raise HTTPException(status_code=500, detail="Failed to persist Dhan credentials")
 
 
-# -----------------------
-# Delete & sync (unchanged but robustified)
-# -----------------------
 @router.delete("/{broker_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_broker(
     broker_id: str,
@@ -316,7 +303,6 @@ async def sync_broker(
         logger.exception("Decryption failed for broker %s", broker_id)
         raise HTTPException(status_code=500, detail="Failed to decrypt credentials")
 
-    # Dhan must have access_token
     if "dhan" in broker_record["broker_name"].lower():
         if "access_token" not in credentials:
             raise HTTPException(status_code=401, detail="Dhan not connected; please reconnect via OAuth")
@@ -341,21 +327,40 @@ async def sync_broker(
         logger.exception("Error fetching or normalizing trades: %s", e)
         raise HTTPException(status_code=502, detail="Failed to fetch trades from broker")
 
-    # 6. Insert trades (best effort)
+    # -------------------------------------------------------------
+    # 6. OPTIMIZATION: Bulk Upsert (Batch Write)
+    # -------------------------------------------------------------
     inserted = 0
-    for trade in normalized_trades:
-        trade["user_id"] = user_id
-        trade["broker_account_id"] = broker_id
-        trade["source_type"] = "AUTO_SYNC"
+    if normalized_trades:
+        # Prepare batch data
+        batch_data = []
+        for trade in normalized_trades:
+            # Add ownership fields to every record
+            trade["user_id"] = user_id
+            trade["broker_account_id"] = broker_id
+            trade["source_type"] = "AUTO_SYNC"
+            batch_data.append(trade)
+
         try:
-            supabase.table("trades").insert(trade).execute()
-            inserted += 1
+            # Perform a SINGLE database call for all trades
+            # ignore_duplicates=True prevents failure if a trade already exists
+            # (Requires a unique constraint on your 'trades' table, e.g. user_id + symbol + entry_time)
+            res = supabase.table("trades").upsert(batch_data, ignore_duplicates=True).execute()
+            
+            # Count how many rows were affected (approximate)
+            inserted = len(res.data) if res.data else len(batch_data)
+            
         except Exception as e:
-            if "duplicate" not in str(e).lower():
-                logger.warning("Failed to insert trade: %s", e)
+            logger.error(f"Bulk sync failed for {broker_record['broker_name']}: {e}")
+            # Fallback: detailed logging or partial retry logic could go here
+            raise HTTPException(status_code=500, detail="Database bulk sync failed")
 
     # 7. Update sync timestamp
     now = datetime.utcnow().isoformat()
     supabase.table("broker_accounts").update({"last_sync_time": now}).eq("id", broker_id).execute()
 
-    return {"status": "success", "message": f"Synced {inserted} trades from {broker_record['broker_name']}", "trades_synced": inserted}
+    return {
+        "status": "success", 
+        "message": f"Synced {inserted} trades from {broker_record['broker_name']}", 
+        "trades_synced": inserted
+    }

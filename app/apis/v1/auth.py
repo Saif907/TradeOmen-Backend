@@ -4,12 +4,13 @@ from typing import Dict, Any, Optional
 from pydantic import BaseModel
 import logging
 
-from app.auth.dependency import get_current_user
-
-# Import Supabase client safely
+# 1. IMPORT THE CACHE directly from the dependency file
+from app.auth.dependency import get_current_user, _USER_CACHE
 
 import os
 from supabase import create_client, Client
+
+# Initialize Supabase Client
 url = os.environ.get("SUPABASE_URL")
 key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 supabase: Client = create_client(url, key)
@@ -30,7 +31,7 @@ async def update_user_me(
     user_update: UserUpdate, 
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    # 1. Get User ID (Supabase Auth usually puts the UUID in 'sub')
+    # 1. Get User ID
     user_id = current_user.get("sub") or current_user.get("user_id") or current_user.get("id")
     
     if not user_id:
@@ -42,12 +43,11 @@ async def update_user_me(
     if not update_data:
         return current_user
 
-    # ✅ SAFEGUARD: Remove 'full_name' because your 'user_profiles' schema doesn't have it.
-    # This prevents "column full_name does not exist" error.
+    # ✅ SAFEGUARD: Remove 'full_name' if schema doesn't support it
     if "full_name" in update_data:
         update_data.pop("full_name")
 
-    # If nothing left to update (e.g. only full_name was sent), just return
+    # If nothing left to update, just return
     if not update_data:
         return current_user
 
@@ -55,9 +55,18 @@ async def update_user_me(
 
     try:
         # 3. Perform Update
-        # ✅ FIX: Use .eq("id", user_id) to match your DB schema primary key
         response = supabase.table("user_profiles").update(update_data).eq("id", user_id).execute()
         
+        # ---------------------------------------------------------
+        # 4. CACHE INVALIDATION (The Fix)
+        # ---------------------------------------------------------
+        # Immediately remove the user from cache. 
+        # The next request will be forced to fetch the new data from DB.
+        if user_id in _USER_CACHE:
+            del _USER_CACHE[user_id]
+            logger.info(f"🧹 Cache cleared for user {user_id}")
+        # ---------------------------------------------------------
+
         if not response.data:
             logger.warning(f"⚠️ Update succeeded but no row returned. Check if ID {user_id} exists in 'user_profiles'.")
             return {**current_user, **update_data}
@@ -67,5 +76,4 @@ async def update_user_me(
 
     except Exception as e:
         logger.error(f"❌ DATABASE ERROR: {str(e)}")
-        # Returns specific error details to help debugging
         raise HTTPException(status_code=500, detail=f"Database Update Failed: {str(e)}")

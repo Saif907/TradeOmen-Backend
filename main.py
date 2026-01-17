@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -9,7 +10,12 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from app.core.config import settings
 from app.core.database import db
 from app.core.exception import register_exception_handlers
-from app.apis.v1 import api_router as api_v1_router 
+from app.apis.v1 import api_router as api_v1_router
+
+# ✅ NEW IMPORTS for Optimization & Monitoring
+from app.core.middleware import APIMonitorMiddleware
+from app.services.performance_monitor import PerformanceMonitor
+from app.services.metrics_engine import MetricsEngine
 
 # --------------------------------------------------------------------------
 # Logging Setup
@@ -26,16 +32,29 @@ logger = logging.getLogger("tradeomen.main")
 # --------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Startup: Connect to DB
+    # ------------------------------------
+    # 1. Startup
+    # ------------------------------------
     try:
         await db.connect()
         logger.info("✅ Database connected successfully")
+        
+        # 🚀 Start the "Zero-Noise" Performance Monitor in background
+        asyncio.create_task(PerformanceMonitor.start_background_monitor())
+        
     except Exception as e:
         logger.error(f"❌ Database connection failed: {e}")
     
     yield  # App runs here
 
-    # 2. Shutdown: Disconnect DB
+    # ------------------------------------
+    # 2. Shutdown
+    # ------------------------------------
+    logger.info("🛑 Shutting down...")
+    
+    # 💾 Force flush any buffered logs/metrics to DB
+    await MetricsEngine.force_flush_all()
+    
     await db.disconnect()
     logger.info("🛑 Database disconnected")
 
@@ -66,7 +85,7 @@ app.add_middleware(
 # 2. Performance: GZip Compression
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# 3. Connectivity: CORS (Fixes Access-Control-Allow-Origin errors)
+# 3. Connectivity: CORS
 allow_origins = [
     "http://localhost:5173",      # Standard Vite
     "http://127.0.0.1:5173",
@@ -88,6 +107,11 @@ app.add_middleware(
     allow_methods=["*"], 
     allow_headers=["*"], 
 )
+
+# 4. ✅ MONITORING: API Latency & Error Tracking
+# We add this LAST so it becomes the OUTERMOST layer.
+# It will measure total time including CORS, GZip, and Validation.
+app.add_middleware(APIMonitorMiddleware)
 
 
 # --------------------------------------------------------------------------

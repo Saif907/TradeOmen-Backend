@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     ENVIRONMENT: AppEnvironment = "development"
     LOG_LEVEL: str = "INFO"
     API_V1_STR: str = "/api/v1"
+    
+    # ✅ ADDED: Admin Panel Route Configuration
+    # Defaults to a randomized path for security if not set in .env
+    ADMIN_PANEL_PATH: str = "/super-secret-admin-x9z-portal"
 
     # ---- CONSTANTS (NOT ENV FIELDS) ----
     VALID_LOG_LEVELS: ClassVar[Set[str]] = {
