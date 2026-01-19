@@ -1,5 +1,11 @@
 from enum import Enum
 
+class UserRole(str, Enum):
+    USER = "user"
+    SUPPORT = "support"
+    ADMIN = "admin"
+    SUPER_ADMIN = "super_admin"
+
 class PlanTier(str, Enum):
     FREE = "FREE"
     PRO = "PRO"

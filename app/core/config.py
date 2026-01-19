@@ -262,6 +262,25 @@ class Settings(BaseSettings):
             if self.LLM_PROVIDER == "perplexity" and not self.PERPLEXITY_API_KEY:
                 sys.exit("❌ FATAL: PERPLEXITY_API_KEY required for Perplexity provider")
 
+    # --------------------------------------------------
+    # 13. Rate Limiting Strategy
+    # --------------------------------------------------
+    # MVP: "memory://" (Local RAM)
+    # Production Scale: "redis://user:pass@localhost:6379/0"
+    RATE_LIMIT_STORAGE_URL: str = "memory://"
 
+    # --------------------------------------------------
+    # 14. Analytics (PostHog)
+    # --------------------------------------------------
+    # Pydantic will automatically map POSTHOG_API_KEY from .env to this variable
+    POSTHOG_API_KEY: str = ""
+    POSTHOG_HOST: str = "https://us.i.posthog.com"
+
+    @property
+    def analytics_enabled(self) -> bool:
+        return bool(self.POSTHOG_API_KEY)
+    
+
+    
 # Singleton
 settings = Settings()

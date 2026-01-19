@@ -5,7 +5,8 @@ import asyncio
 import uuid
 from typing import Dict, Any, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form
+# ✅ Added 'Request' to imports
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Request
 from starlette.concurrency import run_in_threadpool
 from supabase import Client
 
@@ -16,6 +17,9 @@ from app.services.chat_pipeline import ChatPipeline
 from app.lib.data_sanitizer import sanitizer
 from app.lib.csv_parser import csv_parser
 from app.apis.v1.chat.dependencies import get_authenticated_client
+
+# ✅ Added Limiter Import
+from app.core.limiter import limiter
 
 from app.schemas.chat_schemas import (
     ChatRequest,
@@ -53,12 +57,6 @@ async def _record_usage_background(user_id: str, profile: Dict[str, Any], tokens
     """
     try:
         await QuotaManager.increment_daily_chat(user_id)
-        # Note: reserve_ai_tokens updates the cache/DB with the actual cost
-        # We use a dummy estimate here if this is just incrementing "usage" for reporting,
-        # but QuotaManager.reserve_ai_tokens is usually called BEFORE generation.
-        # If this is post-generation logging, you might just want logging.
-        # However, keeping your existing logic:
-        # await QuotaManager.reserve_ai_tokens(user_id, profile, tokens) 
         pass
     except Exception as e:
         logger.error(f"Background usage update failed for user {user_id}: {e}")
@@ -156,17 +154,15 @@ async def upload_chat_file(
     file: UploadFile = File(...),
     session_id: str = Form(...),
     message: str = Form(""),
-    current_user: Dict[str, Any] = Depends(get_current_user), # ✅ Updated Dependency
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
     Analyzes a CSV file structure and returns a preview/mapping suggestion.
     """
-    # ✅ 1. Manual Quota Check (Zero-DB)
     limits = QuotaManager.limits(QuotaManager._plan(current_user))
     limit = limits.get("monthly_csv_imports")
     
     if limit is not None:
-        # Used count comes from cached profile
         used = current_user.get("monthly_import_count", 0)
         if used >= limit:
              raise HTTPException(
@@ -180,14 +176,9 @@ async def upload_chat_file(
     try:
         content = await file.read()
         
-        # Analyze structure
         analysis = csv_parser.analyze_structure(content)
-        
-        # Heuristic mapping (fast, no LLM cost)
         mapping = csv_parser._heuristic_mapping(analysis["headers"], analysis["sample"])
         
-        # TODO: In production, upload 'content' to Supabase Storage (bucket: 'temp-imports')
-        # returning the storage path instead of a placeholder.
         temp_path = f"temp/{uuid.uuid4()}/{file.filename}"
 
         return {
@@ -212,16 +203,11 @@ async def confirm_import(
 ):
     """
     Placeholder: Actually processes the CSV and inserts trades.
-    Requires downloading file from Storage based on payload.file_path.
     """
     user_id = extract_user_id(current_user)
     
-    # 1. Download file from Storage using payload.file_path
-    # 2. Parse using payload.mapping
-    # 3. Insert trades
+    # 1. Download file, 2. Parse, 3. Insert trades
     
-    # 4. Increment Quota (Async Background)
-    # Note: We update the quota *after* successful import
     await QuotaManager.increment_csv_import(user_id)
 
     return {"status": "success", "count": 0}
@@ -231,22 +217,25 @@ async def confirm_import(
 # 3. Main Chat Endpoint
 # ---------------------------------------------------------------------
 @router.post("", response_model=ChatResponse)
+@limiter.limit("10/minute") # ✅ AI Protection: Rate Limit added
 async def chat(
-    request: ChatRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user), # ✅ Updated Dependency
+    request: Request, # ✅ Required for slowapi (IP extraction)
+    chat_req: ChatRequest, # ✅ Renamed from 'request' to avoid collision
+    current_user: Dict[str, Any] = Depends(get_current_user),
     supabase: Client = Depends(get_authenticated_client),
 ):
     user_id = extract_user_id(current_user)
     
-    # ✅ 1. Validate Access (In-Memory Check)
+    # 1. Validate Access (In-Memory Check)
     QuotaManager.validate_chat_access(current_user)
     
-    raw_message = (request.message or "").strip()
+    # ✅ Updated variable reference from 'request' to 'chat_req'
+    raw_message = (chat_req.message or "").strip()
     if not raw_message:
         raise HTTPException(400, "Message cannot be empty")
 
     message = sanitizer.sanitize(raw_message)
-    session_id = request.session_id
+    session_id = chat_req.session_id
 
     # A. Create session if needed
     if not session_id:
@@ -290,7 +279,7 @@ async def chat(
 
     # D. Process AI Response
     try:
-        # ✅ Pass 'current_user' (profile dict) to pipeline for token management
+        # Pass 'current_user' (profile dict) to pipeline for token management
         response_text = await ChatPipeline.process(current_user, message, history)
     except Exception:
         logger.exception("Chat pipeline failure")
@@ -309,10 +298,8 @@ async def chat(
     )
 
     # F. Usage Tracking (Async)
-    # Just increment daily chat count here. Token reservation happened in pipeline.
     asyncio.create_task(QuotaManager.increment_daily_chat(user_id))
 
-    # Estimation for frontend display (not used for logic)
     est_tokens = max(1, int((len(message) + len(response_text)) / 4))
 
     return {

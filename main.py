@@ -16,6 +16,12 @@ from app.apis.v1 import api_router as api_v1_router
 from app.core.middleware import APIMonitorMiddleware
 from app.services.performance_monitor import PerformanceMonitor
 from app.services.metrics_engine import MetricsEngine
+from app.services.analytics import Analytics  # ✅ Analytics Import
+
+# ✅ NEW IMPORTS for Rate Limiting
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from app.core.limiter import limiter
 
 # --------------------------------------------------------------------------
 # Logging Setup
@@ -41,6 +47,11 @@ async def lifespan(app: FastAPI):
         
         # 🚀 Start the "Zero-Noise" Performance Monitor in background
         asyncio.create_task(PerformanceMonitor.start_background_monitor())
+        
+        # 📊 Initialize Analytics (PostHog)
+        # This checks for the API key and sets up the client
+        Analytics.init()
+        logger.info("✅ Analytics initialized")
         
     except Exception as e:
         logger.error(f"❌ Database connection failed: {e}")
@@ -70,6 +81,13 @@ app = FastAPI(
     docs_url="/docs" if settings.ENVIRONMENT != "production" else None,
     redoc_url="/redoc" if settings.ENVIRONMENT != "production" else None,
 )
+
+# --------------------------------------------------------------------------
+# Rate Limiting Setup
+# --------------------------------------------------------------------------
+# Register the limiter state and the 429 Exception Handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # --------------------------------------------------------------------------

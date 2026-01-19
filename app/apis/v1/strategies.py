@@ -6,12 +6,13 @@ import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request # ✅ Added Request
 
 from app.core.config import settings
 from app.core.database import db
 from app.auth.dependency import get_current_user
-from app.services.quota_manager import QuotaManager  # ✅ NEW IMPORT
+from app.services.quota_manager import QuotaManager 
+from app.core.limiter import limiter # ✅ Rate Limiter Import
 
 # Ensure these schemas exist in app/schemas/strategy_schemas.py
 from app.schemas.strategy_schemas import (
@@ -101,7 +102,9 @@ async def get_strategy(
 
 
 @router.post("/", response_model=StrategyResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("15/minute") # ✅ Rate Limit: Creation Logic
 async def create_strategy(
+    request: Request, # ✅ Required for slowapi
     strategy: StrategyCreate,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -150,7 +153,9 @@ async def create_strategy(
 
 
 @router.patch("/{strategy_id}", response_model=StrategyResponse)
+@limiter.limit("30/minute") # ✅ Rate Limit: Updates
 async def update_strategy(
+    request: Request, # ✅ Required for slowapi
     strategy_id: str,
     strategy: StrategyUpdate,
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -195,7 +200,9 @@ async def update_strategy(
 
 
 @router.delete("/{strategy_id}", status_code=status.HTTP_204_NO_CONTENT)
+@limiter.limit("30/minute") # ✅ Rate Limit: Deletion
 async def delete_strategy(
+    request: Request, # ✅ Required for slowapi
     strategy_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):

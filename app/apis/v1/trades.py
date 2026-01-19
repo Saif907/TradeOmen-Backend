@@ -24,8 +24,9 @@ from app.core.config import settings
 from app.core.database import db
 from app.auth.dependency import get_current_user
 from app.lib.data_sanitizer import sanitizer
-from app.services.quota_manager import QuotaManager  # ✅ 1. Import QuotaManager
+from app.services.quota_manager import QuotaManager 
 from app.lib.encryption import crypto
+from app.core.limiter import limiter  # ✅ Rate Limiter Import
 
 # Import schemas
 from app.schemas.trade_schemas import (
@@ -156,7 +157,9 @@ class ScreenshotService:
 # ---------------------------------------------------------------------
 
 @router.post("/", response_model=TradeResponse, status_code=201)
+@limiter.limit("20/minute") # ✅ Rate Limit: Anti-Spam
 async def create_trade(
+    request: Request, # ✅ Required for slowapi
     trade: TradeCreate,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -283,7 +286,9 @@ async def get_trade_screenshots(
 
 
 @router.put("/{trade_id}", response_model=TradeResponse)
+@limiter.limit("30/minute") # ✅ Rate Limit: Protects DB Writes
 async def update_trade(
+    request: Request, # ✅ Required for slowapi
     trade_id: str,
     payload: TradeUpdate,
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -353,7 +358,9 @@ async def update_trade(
 
 
 @router.delete("/{trade_id}", status_code=204)
+@limiter.limit("30/minute") # ✅ Rate Limit: Prevents destructive loops
 async def delete_trade(
+    request: Request, # ✅ Required for slowapi
     trade_id: str,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -423,8 +430,9 @@ async def export_trades(current_user: Dict[str, Any] = Depends(get_current_user)
 
 
 @router.post("/uploads/trade-screenshots", status_code=201)
+@limiter.limit("15/minute") # ✅ Rate Limit: Expensive Storage Operation
 async def upload_trade_screenshot(
-    request: Request,
+    request: Request, # ✅ Required for slowapi
     files: List[UploadFile] = File(...),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):

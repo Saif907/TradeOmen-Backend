@@ -1,10 +1,9 @@
 # backend/app/apis/v1/__init__.py
 
 from fastapi import APIRouter
-
-# Import Settings to get the SECRET ADMIN PATH
 from app.core.config import settings
 
+# Import all route modules
 from app.apis.v1 import (
     auth,
     trades,
@@ -39,9 +38,10 @@ api_router.include_router(news.router, prefix="/news", tags=["News"])
 # 7. Metrics & Telemetry Router
 api_router.include_router(metrics.router, prefix="/metrics", tags=["Metrics"])
 
-# 8. ✅ Admin Panel Router with Secret Path
+# 8. ✅ FIXED: Admin Panel Router
+# We manually set prefix="/admin" to match the Frontend's request path.
 api_router.include_router(
     admin.router, 
-    prefix=settings.ADMIN_PANEL_PATH, 
+    prefix="/admin",   # <--- Changed from settings.ADMIN_PANEL_PATH to "/admin"
     tags=["Admin Panel"]
 )
