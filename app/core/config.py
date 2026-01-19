@@ -151,7 +151,7 @@ class Settings(BaseSettings):
     EMBEDDING_PROVIDER: Literal["openai", "gemini"] = "openai"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     VECTOR_STORE_TABLE: str = "embeddings"
-    MAX_WORKER_THREADS: int = 8
+    MAX_WORKER_THREADS: int = 2
 
     # --------------------------------------------------
     # 10. Plans & Monetization (CONSTANTS)
